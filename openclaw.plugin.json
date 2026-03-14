@@ -1,0 +1,61 @@
+{
+  "id": "openclaw-wechat-work",
+  "name": "OpenClaw WeChat Work",
+  "version": "0.1.0",
+  "description": "WeCom (企业微信) channel plugin for OpenClaw — 自建应用消息通道。",
+  "channels": ["wechat_work"],
+  "extensions": ["./src/index.js"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "corpId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "企业微信 Corp ID"
+      },
+      "corpSecret": {
+        "type": "string",
+        "minLength": 1,
+        "description": "企业微信 Corp Secret",
+        "x-sensitive": true
+      },
+      "agentId": {
+        "oneOf": [
+          { "type": "number" },
+          { "type": "string", "pattern": "^[0-9]+$" }
+        ],
+        "description": "企业微信 Agent ID"
+      },
+      "callbackToken": {
+        "type": "string",
+        "minLength": 1,
+        "description": "回调 Token",
+        "x-sensitive": true
+      },
+      "callbackAesKey": {
+        "type": "string",
+        "minLength": 1,
+        "description": "回调 AES Key（43 位 Base64）",
+        "x-sensitive": true
+      },
+      "webhookPath": {
+        "type": "string",
+        "default": "/wecom/callback",
+        "description": "Webhook 路径"
+      }
+    }
+  },
+  "uiHints": {
+    "corpSecret": { "sensitive": true },
+    "callbackToken": { "sensitive": true },
+    "callbackAesKey": { "sensitive": true }
+  },
+  "channel": {
+    "id": "wechat_work",
+    "label": "企业微信 WeChat Work",
+    "docsPath": "/channels/wechat_work",
+    "blurb": "企业微信自建应用消息通道。",
+    "aliases": ["wecom", "wework"]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@anthropic/openclaw-wechat-work",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": "./src/index.js",
+  "openclaw": {
+    "extensions": ["./src/index.js"],
+    "channel": {
+      "id": "wechat_work",
+      "label": "企业微信 WeChat Work",
+      "docsPath": "/channels/wechat_work",
+      "blurb": "企业微信自建应用消息通道。",
+      "aliases": ["wecom", "wework"]
+    }
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.3.5"
+  }
+}
