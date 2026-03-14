@@ -35,8 +35,12 @@ export async function dispatchToAgent({
     OriginatingTo: fromUser,
   };
 
-  const deliver = async (text) => {
+  const deliver = async (payload, info) => {
+    // payload is { text, mediaUrl?, mediaUrls?, mediaType? }, info is { kind: "block"|"final" }
+    const text = typeof payload === "string" ? payload : payload?.text;
     if (!text) return;
+    // With disableBlockStreaming, we only send on "final" (or if info is absent)
+    if (info?.kind === "block") return;
     await sendText({ cfg, toUser: fromUser, text, logger: api.logger });
   };
 
@@ -57,13 +61,17 @@ export async function dispatchToAgent({
   try {
     await api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx,
-      cfg: { channels: { wechat_work: cfg } },
+      cfg: api.config,
       dispatcherOptions: {
         deliver,
         onError,
       },
       replyOptions: {
         disableBlockStreaming: true,
+        routeOverrides: {
+          sessionKey: sessionId,
+          accountId: "default",
+        },
       },
     });
   } catch (err) {
