@@ -66,3 +66,6 @@ https://developer.work.weixin.qq.com/document/path/90236
 
 #### Wechat work app menus
 https://developer.work.weixin.qq.com/document/path/90231
+
+#### Openclaw plugin
+https://docs.openclaw.ai/tools/plugin
