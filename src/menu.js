@@ -8,6 +8,7 @@ export const MENU_KEY_MAP = {
   CMD_REASONING: "/reasoning",
   CMD_ABOUT: "/about",
   CMD_FEEDBACK: "/feedback",
+  CMD_RESTART: "/restart",
 };
 
 const MENU_DEFINITION = {
@@ -59,6 +60,11 @@ const MENU_DEFINITION = {
           type: "click",
           name: "\u53cd\u9988",
           key: "CMD_FEEDBACK",
+        },
+        {
+          type: "click",
+          name: "\u91cd\u542f\u7f51\u5173",
+          key: "CMD_RESTART",
         },
       ],
     },

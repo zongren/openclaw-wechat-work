@@ -14,37 +14,68 @@ const FEEDBACK_FILE = path.join(
 
 // ── Local command handlers ────────────────────────────────────────────────────
 
+function formatUptime(seconds) {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const parts = [];
+  if (d > 0) parts.push(`${d}天`);
+  if (h > 0) parts.push(`${h}小时`);
+  parts.push(`${m}分钟`);
+  return parts.join("");
+}
+
 async function handleStatus({ api, cfg, fromUser, sessionId }) {
-  let text;
+  const lines = [];
+
+  // ── Basic service info
+  let model = "Claude";
+  let lastStr = null;
   try {
-    // Try to get real session info from the runtime
     const sessions = await api.runtime?.sessions?.list?.();
     const session  = sessions?.find?.(
       (s) => s.sessionKey === sessionId || s.key === sessionId
     );
-
     if (session) {
-      const model    = session.model || session.modelId || "Claude";
-      const lastAt   = session.lastActivityAt || session.updatedAt || session.createdAt;
-      const lastStr  = lastAt
-        ? new Date(lastAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })
-        : "未知";
-      text =
-        `✅ 服务运行正常\n` +
-        `🤖 模型：${model}\n` +
-        `📡 频道：企业微信\n` +
-        `🕐 最近活跃：${lastStr}`;
-    } else {
-      throw new Error("session not found");
+      model = session.model || session.modelId || model;
+      const lastAt = session.lastActivityAt || session.updatedAt || session.createdAt;
+      if (lastAt) {
+        lastStr = new Date(lastAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+      }
     }
   } catch {
-    // Fallback — runtime API doesn't expose what we need
-    text =
-      `✅ 服务运行正常\n` +
-      `🤖 模型：Claude\n` +
-      `📡 频道：企业微信`;
+    // runtime API unavailable — use defaults
   }
-  return text;
+
+  lines.push(`✅ 服务运行正常`);
+  lines.push(`🤖 模型：${model}`);
+  lines.push(`📡 频道：企业微信`);
+
+  // ── Uptime & runtime info
+  const uptime = formatUptime(process.uptime());
+  lines.push(`⏱️ 运行时长：${uptime}`);
+  lines.push(`📦 Node.js：${process.version}`);
+
+  // ── Memory usage
+  const mem = process.memoryUsage();
+  const rss = (mem.rss / 1024 / 1024).toFixed(1);
+  const heap = (mem.heapUsed / 1024 / 1024).toFixed(1);
+  lines.push(`💾 内存：${rss} MB (堆: ${heap} MB)`);
+
+  // ── Per-user mode states
+  const reasoning = reasoningMode.get(fromUser) ?? false;
+  const feedback  = feedbackMode.get(fromUser) ?? false;
+  lines.push(`🧠 推理模式：${reasoning ? "开启" : "关闭"}`);
+  lines.push(`📝 反馈模式：${feedback ? "等待输入" : "关闭"}`);
+
+  // ── Session & timestamp
+  if (lastStr) {
+    lines.push(`🕐 最近活跃：${lastStr}`);
+  }
+  const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+  lines.push(`📅 查询时间：${now}`);
+
+  return lines.join("\n");
 }
 
 async function handleReasoning({ fromUser }) {
@@ -74,6 +105,21 @@ function handleAbout() {
 async function handleFeedback({ fromUser }) {
   feedbackMode.set(fromUser, true);
   return "📝 请输入您的反馈内容，下一条消息将作为反馈提交。";
+}
+
+async function handleRestart({ api, cfg, fromUser }) {
+  api.logger?.info?.(`wechat_work: restart requested by user=${fromUser}`);
+  try {
+    await sendText({ cfg, toUser: fromUser, text: "🔄 正在重启网关，请稍候...", logger: api.logger });
+  } catch {
+    // best-effort notification before restart
+  }
+  // Schedule restart slightly deferred so the reply is sent first
+  setTimeout(() => {
+    api.logger?.info?.("wechat_work: exiting process for restart");
+    process.exit(0);
+  }, 1000);
+  return null; // reply already sent above
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
@@ -128,6 +174,10 @@ export async function dispatchToAgent({
 
       case "/feedback":
         replyText = await handleFeedback({ fromUser });
+        break;
+
+      case "/restart":
+        replyText = await handleRestart({ api, cfg, fromUser });
         break;
 
       default:
