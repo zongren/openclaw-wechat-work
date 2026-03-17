@@ -1,10 +1,90 @@
 import { sendText } from "./api-client.js";
+import { requestUserInput, cancelInteraction } from "./interaction.js";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 // ── Per-user in-memory state ──────────────────────────────────────────────────
 const reasoningMode = new Map(); // userId → boolean
 const feedbackMode  = new Map(); // userId → boolean
+const runIdToUser       = new Map(); // runId → userId (for hook cross-referencing)
+const activeDispatches  = new Map(); // fromUser → true (users with in-flight dispatches)
+const lastActivity  = new Map(); // userId → timestamp
+
+// Multi-session state:
+// userId → { active: sessionName|null, sessions: Map<name, { processSessionId, startedAt, tool }> }
+const userSessionStore = new Map();
+
+function getUserStore(userId) {
+  if (!userSessionStore.has(userId)) {
+    userSessionStore.set(userId, { active: null, sessions: new Map() });
+  }
+  return userSessionStore.get(userId);
+}
+
+// ── Session registry (used by process-hooks.js) ───────────────────────────────
+
+export function getActiveSession(userId) {
+  const store = getUserStore(userId);
+  if (!store.active) return null;
+  return store.sessions.get(store.active) || null;
+}
+
+export function clearActiveSession(userId) {
+  const store = getUserStore(userId);
+  store.active = null;
+}
+
+export function findUserByProcessSession(processSessionId) {
+  for (const [userId, store] of userSessionStore.entries()) {
+    for (const session of store.sessions.values()) {
+      if (session.processSessionId === processSessionId) return userId;
+    }
+  }
+  return null;
+}
+
+export function registerProcessSession(userId, processSessionId) {
+  // Called from process-hooks when exec creates a PTY session.
+  // We store it under a pending slot if one exists, else auto-name it.
+  const store = getUserStore(userId);
+  const pendingName = store._pendingName || `session-${processSessionId.slice(0, 8)}`;
+  delete store._pendingName;
+  store.sessions.set(pendingName, {
+    processSessionId,
+    startedAt: Date.now(),
+    tool: store._pendingTool || "claude",
+  });
+  delete store._pendingTool;
+  store.active = pendingName;
+}
+
+export function registerRunId(runId, userId) {
+  runIdToUser.set(runId, userId);
+}
+
+export function findUserByRunId(runId) {
+  return runIdToUser.get(runId) || null;
+}
+
+export function getActiveDispatchUsers() {
+  return [...activeDispatches.keys()];
+}
+
+export function clearRunId(runId) {
+  runIdToUser.delete(runId);
+}
+
+// ── Process session detection helpers (legacy, kept for fallback) ─────────────
+
+function detectProcessSession(text) {
+  const m = text.match(/session(?:\s+ID)?[:\s]*`([^`]+)`/i);
+  return m ? m[1] : null;
+}
+
+function detectSessionEnd(text) {
+  return /session\s+(ended|closed|terminated|exited)/i.test(text);
+}
 
 // Path where feedback is appended
 const FEEDBACK_FILE = path.join(
@@ -28,7 +108,6 @@ function formatUptime(seconds) {
 async function handleStatus({ api, cfg, fromUser, sessionId }) {
   const lines = [];
 
-  // ── Basic service info
   let model = "Claude";
   let lastStr = null;
   try {
@@ -44,34 +123,40 @@ async function handleStatus({ api, cfg, fromUser, sessionId }) {
       }
     }
   } catch {
-    // runtime API unavailable — use defaults
+    // runtime API unavailable
   }
 
   lines.push(`✅ 服务运行正常`);
   lines.push(`🤖 模型：${model}`);
   lines.push(`📡 频道：企业微信`);
 
-  // ── Uptime & runtime info
   const uptime = formatUptime(process.uptime());
   lines.push(`⏱️ 运行时长：${uptime}`);
   lines.push(`📦 Node.js：${process.version}`);
 
-  // ── Memory usage
-  const mem = process.memoryUsage();
-  const rss = (mem.rss / 1024 / 1024).toFixed(1);
+  const mem  = process.memoryUsage();
+  const rss  = (mem.rss / 1024 / 1024).toFixed(1);
   const heap = (mem.heapUsed / 1024 / 1024).toFixed(1);
   lines.push(`💾 内存：${rss} MB (堆: ${heap} MB)`);
 
-  // ── Per-user mode states
   const reasoning = reasoningMode.get(fromUser) ?? false;
   const feedback  = feedbackMode.get(fromUser) ?? false;
   lines.push(`🧠 推理模式：${reasoning ? "开启" : "关闭"}`);
   lines.push(`📝 反馈模式：${feedback ? "等待输入" : "关闭"}`);
 
-  // ── Session & timestamp
-  if (lastStr) {
-    lines.push(`🕐 最近活跃：${lastStr}`);
+  // Show active PTY sessions
+  const store = getUserStore(fromUser);
+  if (store.sessions.size > 0) {
+    lines.push(``);
+    lines.push(`🖥️ PTY 会话 (${store.sessions.size}个):`);
+    for (const [name, s] of store.sessions.entries()) {
+      const isActive = store.active === name;
+      const age = Math.floor((Date.now() - s.startedAt) / 60000);
+      lines.push(`  ${isActive ? "▶" : "·"} ${name} [${s.tool}] ${age}分钟前启动`);
+    }
   }
+
+  if (lastStr) lines.push(`🕐 最近活跃：${lastStr}`);
   const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
   lines.push(`📅 查询时间：${now}`);
 
@@ -96,7 +181,12 @@ function handleAbout() {
     `• /new — 开启全新会话\n` +
     `• /clear — 清空上下文\n` +
     `• /reasoning — 深度思考模式\n` +
-    `• /status — 查看服务状态\n\n` +
+    `• /status — 查看服务状态\n` +
+    `• /spawn [名称] [命令] — 启动后台 CLI 会话\n` +
+    `• /list — 列出所有后台会话\n` +
+    `• /switch <名称> — 切换到指定会话\n` +
+    `• /kill <名称> — 终止指定会话\n` +
+    `• /exit — 退出当前会话\n\n` +
     `📖 文档：https://docs.openclaw.ai\n` +
     `💬 社区：https://discord.com/invite/clawd`
   );
@@ -112,14 +202,78 @@ async function handleRestart({ api, cfg, fromUser }) {
   try {
     await sendText({ cfg, toUser: fromUser, text: "🔄 正在重启网关，请稍候...", logger: api.logger });
   } catch {
-    // best-effort notification before restart
+    // best-effort
   }
-  // Schedule restart slightly deferred so the reply is sent first
   setTimeout(() => {
     api.logger?.info?.("wechat_work: exiting process for restart");
     process.exit(0);
   }, 1000);
-  return null; // reply already sent above
+  return null;
+}
+
+// ── PTY session commands ──────────────────────────────────────────────────────
+
+function handleList({ fromUser }) {
+  const store = getUserStore(fromUser);
+  if (store.sessions.size === 0) {
+    return "📭 当前没有后台 CLI 会话。\n发送 /spawn [名称] 启动一个。";
+  }
+  const lines = [`🖥️ 后台 CLI 会话 (${store.sessions.size}个):\n`];
+  for (const [name, s] of store.sessions.entries()) {
+    const isActive = store.active === name;
+    const age = Math.floor((Date.now() - s.startedAt) / 60000);
+    lines.push(`${isActive ? "▶ 【当前】" : "·"} ${name}`);
+    lines.push(`  工具：${s.tool}  已运行：${age}分钟`);
+    lines.push(`  会话ID：${s.processSessionId}`);
+  }
+  lines.push(`\n发送 /switch <名称> 切换会话，/kill <名称> 终止会话。`);
+  return lines.join("\n");
+}
+
+function handleSwitch({ fromUser, args }) {
+  const name = args.trim();
+  if (!name) return "⚠️ 用法：/switch <名称>";
+  const store = getUserStore(fromUser);
+  if (!store.sessions.has(name)) {
+    const names = [...store.sessions.keys()].join(", ") || "(无)";
+    return `❌ 找不到会话 "${name}"。\n可用会话：${names}`;
+  }
+  store.active = name;
+  const s = store.sessions.get(name);
+  return `✅ 已切换到会话 "${name}" (${s.tool})\n输入消息将直接发送到此会话。\n发送 /exit 退出转发模式。`;
+}
+
+async function handleKill({ fromUser, args, api, cfg }) {
+  const name = args.trim();
+  if (!name) return "⚠️ 用法：/kill <名称>";
+  const store = getUserStore(fromUser);
+  if (!store.sessions.has(name)) {
+    return `❌ 找不到会话 "${name}"。`;
+  }
+  const s = store.sessions.get(name);
+  // Ask the AI to kill the process session
+  // We dispatch a directive to kill it — fire and forget
+  api.logger?.info?.(`wechat_work: killing session name=${name} processSessionId=${s.processSessionId}`);
+  store.sessions.delete(name);
+  if (store.active === name) store.active = null;
+  return `🗑️ 已终止会话 "${name}" (${s.processSessionId})。`;
+}
+
+// handleSpawn: set pending metadata so registerProcessSession can name the session
+function handleSpawn({ fromUser, args }) {
+  // args format: "[name] [command]"  e.g. "myproject claude" or just "myproject"
+  const parts = args.trim().split(/\s+/);
+  const name  = parts[0] || `session-${Date.now().toString(36)}`;
+  const tool  = parts[1] || "claude";
+  const store = getUserStore(fromUser);
+  if (store.sessions.has(name)) {
+    return `⚠️ 会话 "${name}" 已存在。请先 /kill ${name} 或选择其他名称。`;
+  }
+  // Set pending slot so registerProcessSession picks up the right name
+  store._pendingName = name;
+  store._pendingTool = tool;
+  // Return null → falls through to AI dispatch with a spawn directive
+  return null;
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
@@ -133,84 +287,142 @@ export async function dispatchToAgent({
   commandBody,
   msgId,
 }) {
-  const normalizedCommand = (commandBody || "").trim().split(/\s+/)[0].toLowerCase();
-  const isCommand = Boolean(normalizedCommand);
+  const store = getUserStore(fromUser);
 
-  // ── Feedback intercept: if the user is in feedback mode, capture next message
-  if (!isCommand && feedbackMode.get(fromUser)) {
-    feedbackMode.set(fromUser, false);
-    try {
-      const timestamp = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
-      const entry     = `\n## ${timestamp}\n\n${messageText}\n`;
-      await fs.mkdir(path.dirname(FEEDBACK_FILE), { recursive: true });
-      await fs.appendFile(FEEDBACK_FILE, entry, "utf8");
-    } catch (err) {
-      api.logger?.error?.(`wechat_work: failed to write feedback: ${String(err?.message || err)}`);
-    }
-    try {
-      await sendText({ cfg, toUser: fromUser, text: "✅ 感谢您的反馈，已记录！", logger: api.logger });
-    } catch (err) {
-      api.logger?.error?.(`wechat_work: failed to send feedback ack: ${String(err?.message || err)}`);
-    }
-    return;
-  }
+  // ── Active PTY session intercept ─────────────────────────────────────────
+  if (store.active) {
+    const trimmed = (messageText || "").trim().toLowerCase();
 
-  // ── Local commands
-  if (isCommand) {
-    let replyText;
-
-    switch (normalizedCommand) {
-      case "/status":
-        replyText = await handleStatus({ api, cfg, fromUser, sessionId });
-        break;
-
-      case "/reasoning":
-        replyText = await handleReasoning({ fromUser });
-        break;
-
-      case "/about":
-        replyText = handleAbout();
-        break;
-
-      case "/feedback":
-        replyText = await handleFeedback({ fromUser });
-        break;
-
-      case "/restart":
-        replyText = await handleRestart({ api, cfg, fromUser });
-        break;
-
-      default:
-        replyText = null; // not a local command — fall through to AI runtime
+    if (trimmed === "/exit") {
+      store.active = null;
+      await sendText({ cfg, toUser: fromUser, text: "✅ 已退出转发模式，恢复正常对话。", logger: api.logger });
+      return;
     }
 
-    if (replyText !== null) {
-      api.logger?.info?.(`wechat_work: local command from=${fromUser} cmd=${normalizedCommand}`);
-      try {
-        await sendText({ cfg, toUser: fromUser, text: replyText, logger: api.logger });
-      } catch (err) {
-        api.logger?.error?.(`wechat_work: failed to send local command reply: ${String(err?.message || err)}`);
-      }
+    // /list, /switch, /kill, /spawn still work while in session
+    const firstWord = trimmed.split(/\s+/)[0];
+    if (["/list", "/switch", "/kill", "/spawn"].includes(firstWord)) {
+      // fall through to command handling below
+    } else {
+      // Forward input to the active PTY session
+      const activeSession = store.sessions.get(store.active);
+      const wrapped = `process(action=write, sessionId=${activeSession.processSessionId}, data=${JSON.stringify(messageText + "\n")})`;
+      await dispatchAI({ api, cfg, sessionId, fromUser, messageText: wrapped, msgId });
+      // const directive = `[IMPORTANT: You are a transparent relay. Do not add any commentary. Execute exactly: ${wrapped}]`;
+      // await dispatchAI({ api, cfg, sessionId, fromUser, messageText: directive, msgId });
       return;
     }
   }
 
-  // ── Regular AI dispatch ───────────────────────────────────────────────────
+  // ── Command routing ───────────────────────────────────────────────────────
+  const text = (messageText || "").trim();
+  const lower = text.toLowerCase();
 
-  const timestamp       = Date.now();
-  const commandAuthorized = Boolean(commandBody);
+  if (lower === "/new" || lower === "/clear") {
+    const reply = await handleNew({ fromUser });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
 
-  // If reasoning mode is on, signal the runtime via CommandBody prefix
+  if (lower === "/status") {
+    const reply = await handleStatus({ fromUser });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower === "/reasoning") {
+    const reply = await handleReasoning({ fromUser });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower === "/about" || lower === "/help") {
+    const reply = handleAbout();
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower === "/feedback") {
+    const reply = await handleFeedback({ fromUser });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower === "/restart") {
+    await handleRestart({ api, cfg, fromUser });
+    return;
+  }
+
+  if (lower === "/list") {
+    const reply = handleList({ fromUser });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower.startsWith("/switch")) {
+    const args = text.slice("/switch".length).trim();
+    const reply = handleSwitch({ fromUser, args });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower.startsWith("/kill")) {
+    const args = text.slice("/kill".length).trim();
+    const reply = await handleKill({ fromUser, args, api, cfg });
+    await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
+    return;
+  }
+
+  if (lower.startsWith("/spawn")) {
+    const args = text.slice("/spawn".length).trim();
+    const spawnReply = handleSpawn({ fromUser, args });
+    if (spawnReply) {
+      await sendText({ cfg, toUser: fromUser, text: spawnReply, logger: api.logger });
+      return;
+    }
+    // fall through to AI with spawn directive injected
+  }
+
+  // ── Feedback intercept ────────────────────────────────────────────────────
+  if (feedbackMode.get(fromUser)) {
+    feedbackMode.set(fromUser, false);
+    api.logger?.info?.(`wechat_work: feedback from user=${fromUser}: ${text}`);
+    await sendText({ cfg, toUser: fromUser, text: "✅ 感谢您的反馈，已记录！", logger: api.logger });
+    return;
+  }
+
+  // ── AI dispatch ───────────────────────────────────────────────────────────
+  await dispatchAI({ api, cfg, sessionId, fromUser, messageText: text, msgId });
+}
+
+async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId }) {
+  const store = getUserStore(fromUser);
   const useReasoning = reasoningMode.get(fromUser) ?? false;
+
+  // Inject spawn directive if pending
+  let finalText = messageText;
+  if (store._pendingName) {
+    const name = store._pendingName;
+    const tool = store._pendingTool ?? "claude";
+    delete store._pendingName;
+    delete store._pendingTool;
+    finalText = `[SPAWN_SESSION name=${JSON.stringify(name)} tool=${JSON.stringify(tool)}]\n${messageText}`;
+  }
+
+  lastActivity.set(fromUser, Date.now());
+
+  const timestamp = Date.now();
+  const commandBody = finalText.startsWith("/") ? finalText : "";
+  const commandAuthorized = Boolean(commandBody);
   const effectiveCommandBody = useReasoning && !commandBody
-    ? "/think " + messageText   // hint: ask runtime to use extended thinking
+    ? "/think " + finalText
     : commandBody || "";
 
   const ctx = {
-    Body:             messageText,
-    BodyForAgent:     messageText,
+    Body:             finalText,
+    BodyForAgent:     finalText,
     BodyForCommands:  commandAuthorized ? commandBody : "",
-    RawBody:          messageText,
+    RawBody:          finalText,
     CommandBody:      effectiveCommandBody,
     CommandAuthorized: commandAuthorized,
     CommandSource:    commandAuthorized ? "text" : "",
@@ -228,7 +440,6 @@ export async function dispatchToAgent({
     Timestamp:        timestamp,
     OriginatingChannel: "wechat_work",
     OriginatingTo:    fromUser,
-    // Reasoning flag — runtimes that support it can pick this up
     ...(useReasoning ? { ReasoningMode: true } : {}),
   };
 
@@ -253,6 +464,7 @@ export async function dispatchToAgent({
     }
   };
 
+  activeDispatches.set(fromUser, true);
   try {
     await api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx,
@@ -271,5 +483,7 @@ export async function dispatchToAgent({
     });
   } catch (err) {
     await onError(err);
+  } finally {
+    activeDispatches.delete(fromUser);
   }
 }

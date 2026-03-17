@@ -45,5 +45,6 @@ export function extractInboundEnvelope(msgObj) {
     eventType: str(msgObj.Event).toLowerCase(),
     eventKey: str(msgObj.EventKey),
     createTime: str(msgObj.CreateTime),
+    taskId: str(msgObj.TaskId),
   };
 }

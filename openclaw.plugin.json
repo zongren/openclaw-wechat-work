@@ -51,6 +51,9 @@
     "callbackToken": { "sensitive": true },
     "callbackAesKey": { "sensitive": true }
   },
+  "capabilities": {
+    "interaction": true
+  },
   "channel": {
     "id": "wechat_work",
     "label": "企业微信 WeChat Work",

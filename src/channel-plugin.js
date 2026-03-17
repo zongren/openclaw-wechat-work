@@ -1,4 +1,5 @@
 import { sendText } from "./api-client.js";
+import { requestUserInput, hasPendingInteraction, cancelInteraction } from "./interaction.js";
 
 export function createChannelPlugin({ cfg, logger }) {
   return {
@@ -12,6 +13,7 @@ export function createChannelPlugin({ cfg, logger }) {
     },
     capabilities: {
       chatTypes: ["direct"],
+      interaction: true,
     },
     config: {
       listAccountIds: () => ["default"],
@@ -60,6 +62,12 @@ export function createChannelPlugin({ cfg, logger }) {
         await sendText({ cfg, toUser, text, logger });
         return { ok: true };
       },
+    },
+    interaction: {
+      requestInput: ({ toUser, type, prompt, options }) =>
+        requestUserInput({ cfg, toUser, type, prompt, options, logger }),
+      hasPending: (userId) => hasPendingInteraction(userId),
+      cancel: (userId, reason) => cancelInteraction(userId, reason),
     },
   };
 }
