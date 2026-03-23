@@ -461,12 +461,26 @@ function _parseCapture(stdout) {
   return lines;
 }
 
-// Strip TUI chrome (box-drawing, navigation hints, empty lines) to get a clean title
+// Strip TUI chrome (box-drawing, navigation hints, separators, numbered items) from prompt text
+function _cleanPromptText(text) {
+  return text.split("\n")
+    .map(l => l.replace(/[│╭╰╮├╯❯▶]/g, "").trim())  // strip box-drawing chars
+    .filter(l => {
+      if (!l) return false;  // skip empty lines
+      if (/^─+$/.test(l)) return false;  // skip separator lines (────────)
+      if (/^(Enter to|↑|↓|Esc|to select|to navigate|to cancel|·)/i.test(l)) return false;  // skip nav hints
+      if (/^\d+\.\s/.test(l)) return false;  // skip numbered items (they're in options array)
+      return true;
+    })
+    .join(" ")  // join with space instead of newline for cleaner title
+    .replace(/\s+/g, " ")  // collapse multiple spaces
+    .trim();
+}
+
+// Extract a clean title from the prompt text (first non-empty line after cleaning)
 function _cleanPromptTitle(text) {
-  const lines = text.split("\n")
-    .map(l => l.replace(/[│╭╰╮├╯─❯▶]/g, " ").trim())
-    .filter(l => l && !/^(Enter to|↑|↓|Esc|─{3})/.test(l) && !/^\d+\.\s/.test(l));
-  return (lines[0] || "请选择").slice(0, 128);
+  const cleaned = _cleanPromptText(text);
+  return (cleaned || "请选择").slice(0, 128);
 }
 
 async function _handlePrompt(record, text, promptType) {
