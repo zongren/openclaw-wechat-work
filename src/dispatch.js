@@ -3,6 +3,8 @@ import { requestUserInput, cancelInteraction } from "./interaction.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import * as sessionManager from "./session-manager.js";
 
 // ── Per-user in-memory state ──────────────────────────────────────────────────
 const reasoningMode = new Map(); // userId → boolean
@@ -88,9 +90,15 @@ function detectSessionEnd(text) {
 
 // Path where feedback is appended
 const FEEDBACK_FILE = path.join(
-  "C:\\home\\zongren\\.openclaw\\workspace\\memory",
+  os.homedir(),
+  ".openclaw",
+  "workspace",
+  "memory",
   "wechat-feedback.md"
 );
+
+// Per-user custom session keys for /new (fresh AI conversations)
+const sessionOverrides = new Map(); // userId → sessionKey
 
 // ── Local command handlers ────────────────────────────────────────────────────
 
@@ -144,15 +152,15 @@ async function handleStatus({ api, cfg, fromUser, sessionId }) {
   lines.push(`🧠 推理模式：${reasoning ? "开启" : "关闭"}`);
   lines.push(`📝 反馈模式：${feedback ? "等待输入" : "关闭"}`);
 
-  // Show active PTY sessions
-  const store = getUserStore(fromUser);
-  if (store.sessions.size > 0) {
+  // Show tmux CLI sessions from session-manager
+  const sessions = sessionManager.listSessions(fromUser);
+  if (sessions.length > 0) {
     lines.push(``);
-    lines.push(`🖥️ PTY 会话 (${store.sessions.size}个):`);
-    for (const [name, s] of store.sessions.entries()) {
-      const isActive = store.active === name;
-      const age = Math.floor((Date.now() - s.startedAt) / 60000);
-      lines.push(`  ${isActive ? "▶" : "·"} ${name} [${s.tool}] ${age}分钟前启动`);
+    lines.push(`🖥️ CLI 会话 (${sessions.length}个):`);
+    for (const s of sessions) {
+      const marker = s.active ? "▶" : "·";
+      const status = s.dead ? "✗ 已结束" : "✓";
+      lines.push(`  ${marker} [${s.name}] ${s.tool}  ${s.uptime}  ${status}`);
     }
   }
 
@@ -197,6 +205,13 @@ async function handleFeedback({ fromUser }) {
   return "📝 请输入您的反馈内容，下一条消息将作为反馈提交。";
 }
 
+async function handleNew({ fromUser }) {
+  // Create a fresh session key so subsequent AI dispatches start a new conversation
+  const newKey = `wechat_work:${fromUser}:${Date.now()}`;
+  sessionOverrides.set(fromUser, newKey);
+  return "🆕 已开启新会话，上下文已清空。";
+}
+
 async function handleRestart({ api, cfg, fromUser }) {
   api.logger?.info?.(`wechat_work: restart requested by user=${fromUser}`);
   try {
@@ -211,52 +226,44 @@ async function handleRestart({ api, cfg, fromUser }) {
   return null;
 }
 
-// ── PTY session commands ──────────────────────────────────────────────────────
+// ── PTY session commands (delegate to session-manager) ────────────────────────
 
 function handleList({ fromUser }) {
-  const store = getUserStore(fromUser);
-  if (store.sessions.size === 0) {
-    return "📭 当前没有后台 CLI 会话。\n发送 /spawn [名称] 启动一个。";
+  const sessions = sessionManager.listSessions(fromUser);
+  if (sessions.length === 0) {
+    return "📭 当前没有 CLI 会话。\n发送 /claude [名称] 启动一个。";
   }
-  const lines = [`🖥️ 后台 CLI 会话 (${store.sessions.size}个):\n`];
-  for (const [name, s] of store.sessions.entries()) {
-    const isActive = store.active === name;
-    const age = Math.floor((Date.now() - s.startedAt) / 60000);
-    lines.push(`${isActive ? "▶ 【当前】" : "·"} ${name}`);
-    lines.push(`  工具：${s.tool}  已运行：${age}分钟`);
-    lines.push(`  会话ID：${s.processSessionId}`);
+  const lines = [`🖥️ CLI 会话 (${sessions.length}个):\n`];
+  for (const s of sessions) {
+    const marker = s.active ? "▶ 【当前】" : "·";
+    const status = s.dead ? " ✗ 已结束" : "";
+    lines.push(`${marker} ${s.name}`);
+    lines.push(`  工具：${s.tool}  运行时长：${s.uptime}${status}`);
   }
-  lines.push(`\n发送 /switch <名称> 切换会话，/kill <名称> 终止会话。`);
+  lines.push(`\n发送 /switch <名称> 切换会话，/kill <名称> 终止会话，/exit 退出转发模式。`);
   return lines.join("\n");
 }
 
-function handleSwitch({ fromUser, args }) {
+async function handleSwitch({ fromUser, args }) {
   const name = args.trim();
   if (!name) return "⚠️ 用法：/switch <名称>";
-  const store = getUserStore(fromUser);
-  if (!store.sessions.has(name)) {
-    const names = [...store.sessions.keys()].join(", ") || "(无)";
-    return `❌ 找不到会话 "${name}"。\n可用会话：${names}`;
+  try {
+    await sessionManager.switchSession(fromUser, name);
+    return `✅ 已切换到会话 "${name}"。\n输入消息将直接发送到此会话。\n发送 /exit 退出转发模式。`;
+  } catch (err) {
+    return `❌ ${err.message}`;
   }
-  store.active = name;
-  const s = store.sessions.get(name);
-  return `✅ 已切换到会话 "${name}" (${s.tool})\n输入消息将直接发送到此会话。\n发送 /exit 退出转发模式。`;
 }
 
-async function handleKill({ fromUser, args, api, cfg }) {
+async function handleKill({ fromUser, args }) {
   const name = args.trim();
   if (!name) return "⚠️ 用法：/kill <名称>";
-  const store = getUserStore(fromUser);
-  if (!store.sessions.has(name)) {
-    return `❌ 找不到会话 "${name}"。`;
+  try {
+    await sessionManager.killSession(fromUser, name);
+    return `🗑️ 已终止会话 "${name}"。`;
+  } catch (err) {
+    return `❌ ${err.message}`;
   }
-  const s = store.sessions.get(name);
-  // Ask the AI to kill the process session
-  // We dispatch a directive to kill it — fire and forget
-  api.logger?.info?.(`wechat_work: killing session name=${name} processSessionId=${s.processSessionId}`);
-  store.sessions.delete(name);
-  if (store.active === name) store.active = null;
-  return `🗑️ 已终止会话 "${name}" (${s.processSessionId})。`;
 }
 
 // handleSpawn: set pending metadata so registerProcessSession can name the session
@@ -287,31 +294,19 @@ export async function dispatchToAgent({
   commandBody,
   msgId,
 }) {
-  const store = getUserStore(fromUser);
-
-  // ── Active PTY session intercept ─────────────────────────────────────────
-  if (store.active) {
-    const trimmed = (messageText || "").trim().toLowerCase();
-
-    if (trimmed === "/exit") {
-      store.active = null;
-      await sendText({ cfg, toUser: fromUser, text: "✅ 已退出转发模式，恢复正常对话。", logger: api.logger });
-      return;
+  // ── Active tmux session intercept ────────────────────────────────────────
+  // If user has an active direct CLI session, route non-command messages to it
+  // and bypass the AI dispatcher entirely.
+  const text0 = (messageText || "").trim();
+  const lower0 = text0.toLowerCase();
+  const activeSession = sessionManager.getActiveSession(fromUser);
+  if (activeSession && !lower0.startsWith("/")) {
+    try {
+      await sessionManager.sendInput(fromUser, text0);
+    } catch (err) {
+      await sendText({ cfg, toUser: fromUser, text: `❌ ${err.message}`, logger: api.logger });
     }
-
-    // /list, /switch, /kill, /spawn still work while in session
-    const firstWord = trimmed.split(/\s+/)[0];
-    if (["/list", "/switch", "/kill", "/spawn"].includes(firstWord)) {
-      // fall through to command handling below
-    } else {
-      // Forward input to the active PTY session
-      const activeSession = store.sessions.get(store.active);
-      const wrapped = `process(action=write, sessionId=${activeSession.processSessionId}, data=${JSON.stringify(messageText + "\n")})`;
-      await dispatchAI({ api, cfg, sessionId, fromUser, messageText: wrapped, msgId });
-      // const directive = `[IMPORTANT: You are a transparent relay. Do not add any commentary. Execute exactly: ${wrapped}]`;
-      // await dispatchAI({ api, cfg, sessionId, fromUser, messageText: directive, msgId });
-      return;
-    }
+    return;
   }
 
   // ── Command routing ───────────────────────────────────────────────────────
@@ -325,7 +320,7 @@ export async function dispatchToAgent({
   }
 
   if (lower === "/status") {
-    const reply = await handleStatus({ fromUser });
+    const reply = await handleStatus({ api, cfg, fromUser, sessionId });
     await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
     return;
   }
@@ -353,6 +348,29 @@ export async function dispatchToAgent({
     return;
   }
 
+  if (lower === "/exit") {
+    sessionManager.exitSession(fromUser);
+    await sendText({ cfg, toUser: fromUser, text: "✅ 已退出转发模式，恢复正常 AI 对话。", logger: api.logger });
+    return;
+  }
+
+  if (lower.startsWith("/claude")) {
+    const parts = text.trim().split(/\s+/);
+    const name = parts[1] || undefined; // session-manager auto-generates if undefined
+    try {
+      const { name: finalName } = await sessionManager.spawnSession(fromUser, name, "claude");
+      await sendText({
+        cfg,
+        toUser: fromUser,
+        text: `🚀 正在启动 [${finalName}]... Claude Code 准备好后将自动发送输出。\n发送 /exit 退出转发模式。`,
+        logger: api.logger,
+      });
+    } catch (err) {
+      await sendText({ cfg, toUser: fromUser, text: `❌ ${err.message}`, logger: api.logger });
+    }
+    return;
+  }
+
   if (lower === "/list") {
     const reply = handleList({ fromUser });
     await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
@@ -361,14 +379,14 @@ export async function dispatchToAgent({
 
   if (lower.startsWith("/switch")) {
     const args = text.slice("/switch".length).trim();
-    const reply = handleSwitch({ fromUser, args });
+    const reply = await handleSwitch({ fromUser, args });
     await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
     return;
   }
 
   if (lower.startsWith("/kill")) {
     const args = text.slice("/kill".length).trim();
-    const reply = await handleKill({ fromUser, args, api, cfg });
+    const reply = await handleKill({ fromUser, args });
     await sendText({ cfg, toUser: fromUser, text: reply, logger: api.logger });
     return;
   }
@@ -395,9 +413,12 @@ export async function dispatchToAgent({
   await dispatchAI({ api, cfg, sessionId, fromUser, messageText: text, msgId });
 }
 
-async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId }) {
+async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId, runId }) {
   const store = getUserStore(fromUser);
   const useReasoning = reasoningMode.get(fromUser) ?? false;
+
+  // Use per-user session override if set by /new, else fall back to webhook-derived key
+  const effectiveSessionId = sessionOverrides.get(fromUser) || sessionId;
 
   // Inject spawn directive if pending
   let finalText = messageText;
@@ -428,7 +449,7 @@ async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId })
     CommandSource:    commandAuthorized ? "text" : "",
     From:             fromUser,
     To:               fromUser,
-    SessionKey:       sessionId,
+    SessionKey:       effectiveSessionId,
     AccountId:        "default",
     ChatType:         "direct",
     ConversationLabel: fromUser,
@@ -451,7 +472,7 @@ async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId })
   };
 
   const onError = async (err) => {
-    api.logger?.error?.(`wechat_work: dispatch error for session=${sessionId}: ${String(err?.message || err)}`);
+    api.logger?.error?.(`wechat_work: dispatch error for session=${effectiveSessionId}: ${String(err?.message || err)}`);
     try {
       await sendText({
         cfg,
@@ -476,7 +497,7 @@ async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId })
       replyOptions: {
         disableBlockStreaming: true,
         routeOverrides: {
-          sessionKey: sessionId,
+          sessionKey: effectiveSessionId,
           accountId: "default",
         },
       },
@@ -485,5 +506,7 @@ async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId })
     await onError(err);
   } finally {
     activeDispatches.delete(fromUser);
+    // Clean up runId correlation to prevent Map growth
+    if (runId) clearRunId(runId);
   }
 }

@@ -2,6 +2,7 @@ import { createChannelPlugin } from "./channel-plugin.js";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createAgentMenu } from "./menu.js";
 import { createProcessHooks } from "./process-hooks.js";
+import * as sessionManager from "./session-manager.js";
 
 export default function register(api) {
   const cfg = api.config?.channels?.wechat_work;
@@ -25,7 +26,7 @@ export default function register(api) {
 
   logger?.info?.(`wechat_work: registered channel plugin, webhook at ${webhookPath}`);
 
-  // Register process output hooks
+  // Register process output hooks (for AI-mediated sessions)
   if (typeof api.on === "function") {
     const hooks = createProcessHooks({ cfg, logger });
     api.on("before_tool_call", hooks.beforeToolCall);
@@ -35,6 +36,11 @@ export default function register(api) {
   } else {
     logger?.info?.("wechat_work: api.on() not available, skipping process hooks");
   }
+
+  // Initialize session manager (tmux-based direct CLI sessions)
+  sessionManager.init({ cfg, logger }).catch((err) => {
+    logger?.warn?.(`wechat_work: session manager init failed (non-fatal): ${String(err?.message || err)}`);
+  });
 
   // Fire-and-forget menu creation
   if (cfg.corpId && cfg.corpSecret && cfg.agentId) {

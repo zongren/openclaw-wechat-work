@@ -43,13 +43,38 @@
         "type": "string",
         "default": "/wecom/callback",
         "description": "Webhook 路径"
+      },
+      "s3Endpoint": {
+        "type": "string",
+        "description": "S3 兼容存储端点 URL（如 https://minio.example.com），用于上传超大 CLI 输出"
+      },
+      "s3Bucket": {
+        "type": "string",
+        "description": "S3 存储桶名称"
+      },
+      "s3AccessKey": {
+        "type": "string",
+        "description": "S3 Access Key ID",
+        "x-sensitive": true
+      },
+      "s3SecretKey": {
+        "type": "string",
+        "description": "S3 Secret Access Key",
+        "x-sensitive": true
+      },
+      "s3Region": {
+        "type": "string",
+        "default": "us-east-1",
+        "description": "S3 区域（默认 us-east-1）"
       }
     }
   },
   "uiHints": {
     "corpSecret": { "sensitive": true },
     "callbackToken": { "sensitive": true },
-    "callbackAesKey": { "sensitive": true }
+    "callbackAesKey": { "sensitive": true },
+    "s3AccessKey": { "sensitive": true },
+    "s3SecretKey": { "sensitive": true }
   },
   "capabilities": {
     "interaction": true

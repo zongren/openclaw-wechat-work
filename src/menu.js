@@ -9,6 +9,8 @@ export const MENU_KEY_MAP = {
   CMD_ABOUT: "/about",
   CMD_FEEDBACK: "/feedback",
   CMD_RESTART: "/restart",
+  CMD_CLAUDE_NEW: "/claude",
+  CMD_CLAUDE_LIST: "/list",
 };
 
 const MENU_DEFINITION = {
@@ -29,22 +31,22 @@ const MENU_DEFINITION = {
       ],
     },
     {
-      name: "\u5de5\u5177",
+      name: "Claude CLI",
       sub_button: [
         {
           type: "click",
-          name: "\u5e2e\u52a9",
-          key: "CMD_HELP",
+          name: "\u542f\u52a8 Claude",
+          key: "CMD_CLAUDE_NEW",
+        },
+        {
+          type: "click",
+          name: "\u4f1a\u8bdd\u5217\u8868",
+          key: "CMD_CLAUDE_LIST",
         },
         {
           type: "click",
           name: "\u72b6\u6001",
           key: "CMD_STATUS",
-        },
-        {
-          type: "click",
-          name: "\u63a8\u7406\u6a21\u5f0f",
-          key: "CMD_REASONING",
         },
       ],
     },
@@ -53,8 +55,13 @@ const MENU_DEFINITION = {
       sub_button: [
         {
           type: "click",
-          name: "\u5173\u4e8e",
-          key: "CMD_ABOUT",
+          name: "\u5e2e\u52a9",
+          key: "CMD_HELP",
+        },
+        {
+          type: "click",
+          name: "\u63a8\u7406\u6a21\u5f0f",
+          key: "CMD_REASONING",
         },
         {
           type: "click",
