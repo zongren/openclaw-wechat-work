@@ -133,7 +133,7 @@ export async function init({ cfg, logger }) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export async function spawnSession(userId, name, tool = "claude") {
+export async function spawnSession(userId, name, tool = "claude", args = []) {
   if (!_tmuxAvailable) {
     throw new Error("tmux 未安装，无法启动 CLI 会话。");
   }
@@ -161,7 +161,7 @@ export async function spawnSession(userId, name, tool = "claude") {
 
   await fs.writeFile(logFile, "", { flag: "w" });
   await fs.writeFile(metaFile, JSON.stringify({
-    userId, name: finalName, startedAt: Date.now(), tool,
+    userId, name: finalName, startedAt: Date.now(), tool, args,
   }), "utf8");
 
   try {
@@ -184,12 +184,16 @@ export async function spawnSession(userId, name, tool = "claude") {
     throw new Error(`无法附加输出捕获: ${err.message}`);
   }
 
-  await execFile("tmux", ["send-keys", "-t", tmuxName, tool, "Enter"]);
+  // Send command with args to the shell (which has sourced .zshrc)
+  const fullCommand = args.length > 0 ? `${tool} ${args.join(" ")}` : tool;
+  await execFile("tmux", ["send-keys", "-t", tmuxName, "-l", fullCommand]);
+  await execFile("tmux", ["send-keys", "-t", tmuxName, "Enter"]);
 
   const record = {
     shortId,
     name: finalName,
     tool,
+    args,
     startedAt: Date.now(),
     tmuxName,
     logFile,
