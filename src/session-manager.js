@@ -119,6 +119,7 @@ export async function init({ cfg, logger }) {
     logger?.debug?.("wechat_work: session manager already initialized, skipping");
     return;
   }
+  _initialized = true;  // Set immediately to prevent race condition
 
   _cfg = cfg;
   _logger = logger;
@@ -137,8 +138,6 @@ export async function init({ cfg, logger }) {
   await _cleanupStaleFiles();
   await _recoverSessions();
   _startLivenessCheck();
-
-  _initialized = true;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
