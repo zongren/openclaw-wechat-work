@@ -358,7 +358,7 @@ export async function dispatchToAgent({
     const parts = text.trim().split(/\s+/);
     const name = parts[1] || undefined; // session-manager auto-generates if undefined
     try {
-      const { name: finalName } = await sessionManager.spawnSession(fromUser, name, "claude");
+      const { name: finalName } = await sessionManager.spawnSession(fromUser, name, "useclaude", ["zqsy_codeclub3"]);
       await sendText({
         cfg,
         toUser: fromUser,
