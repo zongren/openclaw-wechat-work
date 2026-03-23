@@ -53,7 +53,8 @@ const TRUST_PROMPT_REGEX = /trust this folder|Yes.*I trust|❯.*trust/i;
 
 // Numbered choice list (at least 2 items).
 // Handles both plain "1. Yes" and TUI box "│ ❯ 1. Yes │" formats.
-const NUMBERED_LIST_REGEX = /(?:^|\n).*?(?:❯\s*)?\s*1[.)]\s+\S[^\n]*(?:\n.*?\d+[.)]\s+\S[^\n]*){1,}/;
+// Uses [\s\S]*? to match across multiple lines (including description lines between items)
+const NUMBERED_LIST_REGEX = /(?:^|\n)[\s\S]*?(?:❯\s*)?\s*1[.)]\s+\S[^\n]*(?:\n[\s\S]*?\d+[.)]\s+\S[^\n]*){1,}/;
 
 // Y/N style confirm prompts
 const CONFIRM_REGEX = /\?\s*\(?(?:y(?:es)?)[/|](?:n(?:o)?)\)?\s*:?\s*$|\?\s*\(Y\/n\)\s*$|\?\s*\(y\/N\)\s*$/im;
