@@ -111,7 +111,15 @@ function getOrCreateUserStore(userId) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
+let _initialized = false;
+
 export async function init({ cfg, logger }) {
+  // Prevent duplicate initialization (OpenClaw may call register() multiple times)
+  if (_initialized) {
+    logger?.debug?.("wechat_work: session manager already initialized, skipping");
+    return;
+  }
+
   _cfg = cfg;
   _logger = logger;
 
@@ -129,6 +137,8 @@ export async function init({ cfg, logger }) {
   await _cleanupStaleFiles();
   await _recoverSessions();
   _startLivenessCheck();
+
+  _initialized = true;
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -629,6 +639,13 @@ async function _recoverSessions() {
     const { userId, name, startedAt, tool } = meta;
     if (!userId || !name) continue;
 
+    // Check if session already exists (prevents duplicate recovery on multiple init() calls)
+    const userStore = getOrCreateUserStore(userId);
+    if (userStore.sessions.has(name)) {
+      _logger?.debug?.(`wechat_work: session already recovered, skipping name=${name} user=${userId}`);
+      continue;
+    }
+
     // Stop any existing pipe-pane, then reattach
     await execFile("tmux", ["pipe-pane", "-t", tmuxName]).catch(() => {});
     await execFile("tmux", ["pipe-pane", "-o", "-t", tmuxName, `cat >> ${logFile}`]).catch(() => {});
@@ -659,7 +676,7 @@ async function _recoverSessions() {
     };
 
     _watchLogFile(record);
-    getOrCreateUserStore(userId).sessions.set(name, record);
+    userStore.sessions.set(name, record);
 
     _logger?.info?.(`wechat_work: recovered session name=${name} user=${userId}`);
 
