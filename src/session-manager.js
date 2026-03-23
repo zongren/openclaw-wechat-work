@@ -451,33 +451,85 @@ function _parseCapture(stdout) {
   return lines;
 }
 
-async function _handlePrompt(record, text, promptType) {
-  const prompt = `[${record.name}]\n${text.trim()}`;
+// Strip TUI chrome (box-drawing, navigation hints, empty lines) to get a clean title
+function _cleanPromptTitle(text) {
+  const lines = text.split("\n")
+    .map(l => l.replace(/[│╭╰╮├╯─❯▶]/g, " ").trim())
+    .filter(l => l && !/^(Enter to|↑|↓|Esc|─{3})/.test(l) && !/^\d+\.\s/.test(l));
+  return (lines[0] || "请选择").slice(0, 128);
+}
 
+async function _handlePrompt(record, text, promptType) {
   try {
     if (promptType === "choice") {
-      const options = extractNumberedOptions(text).slice(0, 4);
-      if (options.length === 0) {
+      const allOptions = extractNumberedOptions(text);
+      if (allOptions.length === 0) {
         // No parseable options — forward as free-text prompt
+        const title = _cleanPromptTitle(text);
         const { value } = await requestUserInput({
-          cfg: _cfg, toUser: record.userId, type: "text", prompt, logger: _logger,
+          cfg: _cfg, toUser: record.userId, type: "text",
+          prompt: `[${record.name}] ${title}`, logger: _logger,
         });
         await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, String(value)]);
         await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
         return;
       }
-      const { value } = await requestUserInput({
-        cfg: _cfg, toUser: record.userId, type: "choice", prompt, options, logger: _logger,
-      });
-      // value is the full option text; find its 1-based index to send
-      const idx = options.indexOf(value);
-      const answer = idx >= 0 ? String(idx + 1) : String(value);
-      await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, answer]);
-      await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
+
+      // WeCom button_interaction supports max 4 buttons.
+      // If more than 4 options, send in pages of 3 with a "下一页" button.
+      const title = _cleanPromptTitle(text);
+      const PAGE_SIZE = 4;
+
+      if (allOptions.length <= PAGE_SIZE) {
+        // Simple case — fits in one card
+        const { value } = await requestUserInput({
+          cfg: _cfg, toUser: record.userId, type: "choice",
+          prompt: `[${record.name}] ${title}`,
+          options: allOptions,
+          logger: _logger,
+        });
+        const idx = allOptions.indexOf(value);
+        const answer = idx >= 0 ? String(idx + 1) : String(value);
+        await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, answer]);
+        await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
+      } else {
+        // Paginate: 3 options per page + "更多(n-m)" navigation button
+        let page = 0;
+        while (true) {
+          const start = page * 3;
+          const pageOptions = allOptions.slice(start, start + 3);
+          const hasMore = start + 3 < allOptions.length;
+          const displayOptions = hasMore
+            ? [...pageOptions, `下一页 (${start + 4}-${Math.min(start + 6, allOptions.length)})`]
+            : pageOptions;
+
+          const pageTitle = `[${record.name}] ${title} (${start + 1}-${start + pageOptions.length}/${allOptions.length})`;
+          const { value } = await requestUserInput({
+            cfg: _cfg, toUser: record.userId, type: "choice",
+            prompt: pageTitle,
+            options: displayOptions,
+            logger: _logger,
+          });
+
+          if (value.startsWith("下一页")) {
+            page++;
+            continue; // show next page
+          }
+
+          // Find actual index in full options list
+          const realIdx = allOptions.indexOf(value);
+          const answer = realIdx >= 0 ? String(realIdx + 1) : String(value);
+          await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, answer]);
+          await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
+          break;
+        }
+      }
 
     } else if (promptType === "confirm") {
+      const title = _cleanPromptTitle(text);
       const { value } = await requestUserInput({
-        cfg: _cfg, toUser: record.userId, type: "confirm", prompt, logger: _logger,
+        cfg: _cfg, toUser: record.userId, type: "confirm",
+        prompt: `[${record.name}] ${title}`, logger: _logger,
       });
       await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, value ? "y" : "n"]);
       await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);

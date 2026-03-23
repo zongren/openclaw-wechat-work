@@ -26,24 +26,12 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
 
   const taskId = crypto.randomUUID();
 
-  // Format and send text message (primary — always works)
-  let textMessage;
-  if (type === "choice" && Array.isArray(options) && options.length > 0) {
-    const numbered = options.map((opt, i) => `${i + 1}. ${opt}`).join("\n");
-    textMessage = `${prompt}\n\n请回复数字选择：\n${numbered}`;
-  } else if (type === "confirm") {
-    textMessage = `${prompt}\n\n请回复"是"或"否"确认。`;
-  } else {
-    textMessage = `${prompt}\n\n请直接输入您的回答：`;
-  }
-
-  await sendText({ cfg, toUser, text: textMessage, logger });
-
-  // Attempt template card for choice/confirm (best-effort enhancement)
+  // Try template card first (best UX — tappable buttons)
+  let cardSent = false;
   if (type === "choice" && Array.isArray(options) && options.length > 0) {
     try {
       const buttonList = options.map((opt, i) => ({
-        text: opt,
+        text: opt.slice(0, 32),   // button text max ~32 chars
         style: 1,
         key: `choice_${i + 1}`,
       }));
@@ -58,8 +46,9 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
         },
         logger,
       });
+      cardSent = true;
     } catch (err) {
-      logger?.info?.(`wechat_work: template card send failed (text fallback active): ${String(err?.message || err)}`);
+      logger?.info?.(`wechat_work: template card send failed, using text fallback: ${String(err?.message || err)}`);
     }
   } else if (type === "confirm") {
     try {
@@ -79,9 +68,24 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
         },
         logger,
       });
+      cardSent = true;
     } catch (err) {
-      logger?.info?.(`wechat_work: template card send failed (text fallback active): ${String(err?.message || err)}`);
+      logger?.info?.(`wechat_work: template card send failed, using text fallback: ${String(err?.message || err)}`);
     }
+  }
+
+  // Text fallback — only when card failed or for free-text prompts
+  if (!cardSent) {
+    let textMessage;
+    if (type === "choice" && Array.isArray(options) && options.length > 0) {
+      const numbered = options.map((opt, i) => `${i + 1}. ${opt}`).join("\n");
+      textMessage = `${prompt}\n\n请回复数字选择：\n${numbered}`;
+    } else if (type === "confirm") {
+      textMessage = `${prompt}\n\n请回复"是"或"否"确认。`;
+    } else {
+      textMessage = `${prompt}\n\n请直接输入您的回答：`;
+    }
+    await sendText({ cfg, toUser, text: textMessage, logger });
   }
 
   // Create Promise and store pending entry
