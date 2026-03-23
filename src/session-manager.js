@@ -3,8 +3,16 @@
  *
  * Direct CLI-to-WeChat bridge via tmux.
  * Spawns Claude Code (or other CLI tools) in tmux sessions,
- * captures output via log files, and forwards to WeChat users.
+ * captures output via tmux capture-pane (clean rendered text),
+ * and forwards to WeChat users.
  * Bypasses OpenClaw's AI dispatcher entirely.
+ *
+ * Output pipeline:
+ *   pipe-pane → log file → fs.watch (change detection only)
+ *   → tmux capture-pane -p -S - (rendered terminal text, no ANSI)
+ *   → diff against processedLines → sendText to WeChat
+ *
+ * This avoids the "spaces stripped" problem caused by raw TUI escape sequences.
  */
 
 import { execFile as _execFile } from "node:child_process";
@@ -33,30 +41,25 @@ const store = new Map();
 
 const SESSION_DIR = path.join(os.tmpdir(), "wechat-sessions");
 const MAX_SESSIONS_PER_USER = 10;
-const IDLE_FLUSH_MS = 500;
-const LARGE_OUTPUT_BYTES = 6144; // ~3 WeChat chunks
+const IDLE_FLUSH_MS = 600;       // wait for output to settle before forwarding
+const LARGE_OUTPUT_BYTES = 6144; // ~3 WeChat chunks → S3 fallback
 const LIVENESS_INTERVAL_MS = 30_000;
 
-// ── ANSI stripping ────────────────────────────────────────────────────────────
+// ── Prompt detection (runs on clean capture-pane text) ────────────────────────
 
-// Covers: standard CSI sequences, OSC sequences (including OSC 8 hyperlinks),
-// character set designations, bracketed paste, 256-color/truecolor, etc.
-const ANSI_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|\(B)/g;
+// Trust prompt — Claude Code's folder-trust dialog.
+// capture-pane renders: "  ❯ 1. Yes, I trust this folder"
+const TRUST_PROMPT_REGEX = /trust this folder|Yes.*I trust|❯.*trust/i;
 
-function stripAnsi(text) {
-  return text.replace(ANSI_REGEX, "");
-}
-
-// ── Prompt detection ──────────────────────────────────────────────────────────
-
-// Trust prompt: Claude Code's "Do you trust the files in this folder?" dialog
-const TRUST_PROMPT_REGEX = /trust\s+the\s+files|1\.\s+Yes.*trust|Do you trust/i;
-
-// Numbered list with at least 2 items (choice prompt)
-const NUMBERED_LIST_REGEX = /(?:^|\n)\s*1[.)]\s+\S[^\n]*(?:\n\s*\d+[.)]\s+\S[^\n]*){1,}/;
+// Numbered choice list (at least 2 items).
+// Handles both plain "1. Yes" and TUI box "│ ❯ 1. Yes │" formats.
+const NUMBERED_LIST_REGEX = /(?:^|\n).*?(?:❯\s*)?\s*1[.)]\s+\S[^\n]*(?:\n.*?\d+[.)]\s+\S[^\n]*){1,}/;
 
 // Y/N style confirm prompts
 const CONFIRM_REGEX = /\?\s*\(?(?:y(?:es)?)[/|](?:n(?:o)?)\)?\s*:?\s*$|\?\s*\(Y\/n\)\s*$|\?\s*\(y\/N\)\s*$/im;
+
+// Claude Code is ready for input (past the trust prompt)
+const CLAUDE_READY_REGEX = /Type a message|\/help for help|What would you like|Human:|>\s*$/;
 
 function detectPromptType(text) {
   if (TRUST_PROMPT_REGEX.test(text)) return "trust";
@@ -69,8 +72,13 @@ function extractNumberedOptions(text) {
   const options = [];
   const lines = text.split("\n");
   for (const line of lines) {
-    const m = line.match(/^\s*(\d+)[.)]\s+(.+)/);
-    if (m) options.push(m[2].trim());
+    // Strip box-drawing characters (│, ╭, ╰, ─, ❯, ▶) before matching
+    const cleaned = line.replace(/[│╭╰╮├╯─❯▶]/g, " ").trim();
+    const m = cleaned.match(/^\s*(\d+)[.)]\s+(.+)/);
+    if (m) {
+      const opt = m[2].replace(/\s*│?\s*$/, "").trim();
+      if (opt) options.push(opt);
+    }
   }
   return options;
 }
@@ -107,7 +115,6 @@ export async function init({ cfg, logger }) {
   _cfg = cfg;
   _logger = logger;
 
-  // Check tmux availability
   try {
     await execFile("tmux", ["-V"]);
     _tmuxAvailable = true;
@@ -118,16 +125,9 @@ export async function init({ cfg, logger }) {
     return;
   }
 
-  // Ensure session directory exists
   await fs.mkdir(SESSION_DIR, { recursive: true });
-
-  // Clean up stale files from previous runs
   await _cleanupStaleFiles();
-
-  // Recover live sessions
   await _recoverSessions();
-
-  // Start liveness check
   _startLivenessCheck();
 }
 
@@ -159,28 +159,22 @@ export async function spawnSession(userId, name, tool = "claude") {
   const logFile = path.join(SESSION_DIR, `${shortId}.log`);
   const metaFile = path.join(SESSION_DIR, `${shortId}.meta.json`);
 
-  // Create empty log file first (so pipe-pane has a target)
   await fs.writeFile(logFile, "", { flag: "w" });
-
-  // Write metadata sidecar
   await fs.writeFile(metaFile, JSON.stringify({
-    userId,
-    name: finalName,
-    startedAt: Date.now(),
-    tool,
+    userId, name: finalName, startedAt: Date.now(), tool,
   }), "utf8");
 
-  // Create tmux session
   try {
-    await execFile("tmux", ["new-session", "-d", "-s", tmuxName, "-c", os.homedir()]);
+    // Create tmux session with a wide terminal (220 cols) to reduce line wrapping
+    await execFile("tmux", ["new-session", "-d", "-s", tmuxName, "-c", os.homedir(),
+      "-x", "220", "-y", "50"]);
   } catch (err) {
-    // Clean up on failure
     await fs.unlink(logFile).catch(() => {});
     await fs.unlink(metaFile).catch(() => {});
     throw new Error(`无法创建 tmux 会话: ${err.message}`);
   }
 
-  // Attach pipe-pane to capture output
+  // Attach pipe-pane for change detection (log file will be written; we use capture-pane for content)
   try {
     await execFile("tmux", ["pipe-pane", "-o", "-t", tmuxName, `cat >> ${logFile}`]);
   } catch (err) {
@@ -190,10 +184,8 @@ export async function spawnSession(userId, name, tool = "claude") {
     throw new Error(`无法附加输出捕获: ${err.message}`);
   }
 
-  // Launch the tool
   await execFile("tmux", ["send-keys", "-t", tmuxName, tool, "Enter"]);
 
-  // Build session record
   const record = {
     shortId,
     name: finalName,
@@ -203,8 +195,12 @@ export async function spawnSession(userId, name, tool = "claude") {
     logFile,
     metaFile,
     userId,
-    offset: 0,
-    buffer: "",
+    // Output tracking (capture-pane based)
+    processedLines: 0,       // lines already forwarded in full capture-pane history
+    // Startup management
+    startupPhase: true,      // suppress output until trust prompt handled
+    startupConfirmTimer: null,
+    // State
     flushTimer: null,
     watcherClose: null,
     dead: false,
@@ -216,6 +212,9 @@ export async function spawnSession(userId, name, tool = "claude") {
   userStore.active = finalName;
 
   _logger?.info?.(`wechat_work: spawned tmux session name=${finalName} shortId=${shortId} tool=${tool} user=${userId}`);
+
+  // Schedule trust prompt check + auto-confirm
+  _scheduleTrustConfirm(record, 0);
 
   return { shortId, name: finalName };
 }
@@ -229,9 +228,7 @@ export async function sendInput(userId, text) {
   if (!record || record.dead) {
     throw new Error(`会话 "${userStore.active}" 已结束。`);
   }
-
-  // Two-call pattern: -l sends text literally (no key-name interpretation),
-  // second call sends Enter as a special key. Prevents shell injection.
+  // -l sends text literally (no key-name interpretation) — prevents shell injection
   await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, text]);
   await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
 }
@@ -277,6 +274,7 @@ export function listSessions(userId) {
       uptime: h > 0 ? `${h}h ${m}m` : `${m}m`,
       active: userStore.active === name,
       dead: record.dead,
+      starting: record.startupPhase,
     });
   }
   return result;
@@ -294,6 +292,73 @@ export function isTmuxAvailable() {
   return _tmuxAvailable;
 }
 
+// ── Startup: trust prompt auto-confirm ───────────────────────────────────────
+
+async function _scheduleTrustConfirm(record, attempt) {
+  if (record.dead) return;
+  if (attempt > 8) {
+    // Timed out — end startup phase anyway so output isn't blocked forever
+    _logger?.warn?.(`wechat_work: startup phase timed out for session=${record.name}`);
+    await _endStartupPhase(record);
+    return;
+  }
+
+  const delay = attempt === 0 ? 2500 : 1500;
+
+  record.startupConfirmTimer = setTimeout(async () => {
+    if (record.dead) return;
+    record.startupConfirmTimer = null;
+
+    try {
+      const { stdout } = await execFile("tmux", ["capture-pane", "-p", "-t", record.tmuxName]);
+
+      if (TRUST_PROMPT_REGEX.test(stdout)) {
+        // Trust prompt visible — send Enter (option 1 is pre-selected with ❯)
+        _logger?.info?.(`wechat_work: auto-confirming trust prompt for session=${record.name} (attempt=${attempt})`);
+        await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
+        // Small delay for trust to process before ending startup phase
+        await new Promise(r => setTimeout(r, 800));
+        await _endStartupPhase(record);
+        return;
+      }
+
+      if (CLAUDE_READY_REGEX.test(stdout) || attempt >= 3) {
+        // Claude Code already past trust, or we've waited long enough
+        await _endStartupPhase(record);
+        return;
+      }
+
+      // Not ready yet — retry
+      _scheduleTrustConfirm(record, attempt + 1);
+    } catch {
+      await _endStartupPhase(record);
+    }
+  }, delay);
+}
+
+async function _endStartupPhase(record) {
+  if (record.dead) return;
+
+  // Snapshot current line count so _captureAndProcess skips startup content
+  try {
+    const { stdout } = await execFile("tmux", ["capture-pane", "-p", "-S", "-", "-t", record.tmuxName]);
+    const lines = _parseCapture(stdout);
+    record.processedLines = lines.length;
+  } catch {
+    record.processedLines = 0;
+  }
+
+  record.startupPhase = false;
+
+  // Notify user that Claude Code is ready
+  await sendText({
+    cfg: _cfg,
+    toUser: record.userId,
+    text: `[${record.name}] ✅ Claude Code 已就绪，直接发消息开始对话。\n发送 /exit 可退出转发模式。`,
+    logger: _logger,
+  }).catch(() => {});
+}
+
 // ── Output pipeline ───────────────────────────────────────────────────────────
 
 function _watchLogFile(record) {
@@ -308,63 +373,50 @@ function _watchLogFile(record) {
     _logger?.warn?.(`wechat_work: failed to watch log file for ${record.name}: ${err.message}`);
     return;
   }
-
-  record.watcherClose = () => {
-    try { watcher.close(); } catch {}
-  };
+  record.watcherClose = () => { try { watcher.close(); } catch {} };
 }
 
 async function _onFileChange(record) {
-  if (record.dead) return;
-
-  let stat;
-  try {
-    stat = await fs.stat(record.logFile);
-  } catch {
-    return; // file gone
-  }
-
-  if (stat.size <= record.offset) return; // no new bytes
-
-  // Read new bytes since last offset
-  let fd;
-  try {
-    fd = await fs.open(record.logFile, "r");
-    const length = stat.size - record.offset;
-    const buf = Buffer.allocUnsafe(length);
-    await fd.read(buf, 0, length, record.offset);
-    record.offset = stat.size;
-    record.buffer += buf.toString("utf8");
-  } catch (err) {
-    _logger?.warn?.(`wechat_work: read error for ${record.name}: ${err.message}`);
-    return;
-  } finally {
-    await fd?.close().catch(() => {});
-  }
-
-  // Reset idle timer
+  if (record.dead || record.startupPhase || record.pendingPrompt) return;
+  // Debounce: wait for output to settle before capturing
   if (record.flushTimer) clearTimeout(record.flushTimer);
-  if (!record.pendingPrompt) {
-    record.flushTimer = setTimeout(() => _flushBuffer(record), IDLE_FLUSH_MS);
-  }
+  record.flushTimer = setTimeout(
+    () => _captureAndProcess(record).catch((err) => {
+      _logger?.warn?.(`wechat_work: capture error for ${record.name}: ${err.message}`);
+    }),
+    IDLE_FLUSH_MS
+  );
 }
 
-async function _flushBuffer(record) {
-  if (record.dead || record.pendingPrompt) return;
-
-  const raw = record.buffer;
-  record.buffer = "";
+// Get rendered terminal text via capture-pane (the proper fix for spacing).
+// -p: print to stdout (no ANSI codes)
+// -S -: capture from beginning of scrollback history
+async function _captureAndProcess(record) {
+  if (record.dead || record.startupPhase || record.pendingPrompt) return;
   record.flushTimer = null;
 
-  const text = stripAnsi(raw);
-  if (!text.trim()) return;
+  let stdout;
+  try {
+    ({ stdout } = await execFile("tmux", ["capture-pane", "-p", "-S", "-", "-t", record.tmuxName]));
+  } catch {
+    return;
+  }
 
-  const promptType = detectPromptType(text);
+  const allLines = _parseCapture(stdout);
+
+  if (allLines.length <= record.processedLines) return; // nothing new
+
+  const newLines = allLines.slice(record.processedLines);
+  record.processedLines = allLines.length;
+
+  const newContent = newLines.join("\n").trim();
+  if (!newContent) return;
+
+  const promptType = detectPromptType(newContent);
 
   if (promptType === "trust") {
-    // Auto-confirm trust prompt — send '1' then Enter
-    _logger?.info?.(`wechat_work: auto-confirming trust prompt for session=${record.name}`);
-    await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, "1"]).catch(() => {});
+    // Trust prompt appeared after startup phase (unusual but handle it)
+    _logger?.info?.(`wechat_work: late trust prompt for session=${record.name} — auto-confirming`);
     await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]).catch(() => {});
     return;
   }
@@ -372,49 +424,48 @@ async function _flushBuffer(record) {
   if (promptType === "choice" || promptType === "confirm") {
     record.pendingPrompt = true;
     try {
-      await _handlePrompt(record, text, promptType);
+      await _handlePrompt(record, newContent, promptType);
     } finally {
       record.pendingPrompt = false;
-      // Flush any buffered output that arrived during prompt
-      if (record.buffer.trim()) {
-        record.flushTimer = setTimeout(() => _flushBuffer(record), 0);
-      }
+      // Re-capture after prompt resolves (there will likely be new output)
+      record.flushTimer = setTimeout(
+        () => _captureAndProcess(record).catch(() => {}),
+        300
+      );
     }
     return;
   }
 
-  // No prompt detected — forward as regular output
-  await _sendOutput(record, text);
+  await _sendOutput(record, newContent);
+}
+
+function _parseCapture(stdout) {
+  // Split lines, trim trailing whitespace per line (terminals pad to width)
+  const lines = stdout.split("\n").map(l => l.trimEnd());
+  // Remove trailing empty lines (terminal padding at bottom of screen)
+  while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }
 
 async function _handlePrompt(record, text, promptType) {
-  const prefixed = `[${record.name}] ${text.trim()}`;
+  const prompt = `[${record.name}]\n${text.trim()}`;
 
   try {
     if (promptType === "choice") {
       const options = extractNumberedOptions(text).slice(0, 4);
       if (options.length === 0) {
-        // Fallback: can't extract options, treat as free-text
+        // No parseable options — forward as free-text prompt
         const { value } = await requestUserInput({
-          cfg: _cfg,
-          toUser: record.userId,
-          type: "text",
-          prompt: prefixed,
-          logger: _logger,
+          cfg: _cfg, toUser: record.userId, type: "text", prompt, logger: _logger,
         });
         await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, String(value)]);
         await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
         return;
       }
       const { value } = await requestUserInput({
-        cfg: _cfg,
-        toUser: record.userId,
-        type: "choice",
-        prompt: prefixed,
-        options,
-        logger: _logger,
+        cfg: _cfg, toUser: record.userId, type: "choice", prompt, options, logger: _logger,
       });
-      // value is the option text; find its number to send back
+      // value is the full option text; find its 1-based index to send
       const idx = options.indexOf(value);
       const answer = idx >= 0 ? String(idx + 1) : String(value);
       await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, answer]);
@@ -422,17 +473,13 @@ async function _handlePrompt(record, text, promptType) {
 
     } else if (promptType === "confirm") {
       const { value } = await requestUserInput({
-        cfg: _cfg,
-        toUser: record.userId,
-        type: "confirm",
-        prompt: prefixed,
-        logger: _logger,
+        cfg: _cfg, toUser: record.userId, type: "confirm", prompt, logger: _logger,
       });
       await execFile("tmux", ["send-keys", "-l", "-t", record.tmuxName, value ? "y" : "n"]);
       await execFile("tmux", ["send-keys", "-t", record.tmuxName, "Enter"]);
     }
   } catch (err) {
-    // Timeout or cancellation — send Ctrl+C
+    // Timeout or cancellation — send Ctrl+C to unblock the session
     _logger?.info?.(`wechat_work: prompt timeout/cancelled for session=${record.name}: ${err.message}`);
     await execFile("tmux", ["send-keys", "-t", record.tmuxName, "C-c"]).catch(() => {});
   }
@@ -445,28 +492,21 @@ async function _sendOutput(record, text) {
 
   if (s3Configured && Buffer.byteLength(text, "utf8") > LARGE_OUTPUT_BYTES) {
     try {
-      const timestamp = Date.now();
       const date = new Date().toISOString().slice(0, 10);
-      const filename = `${timestamp}-${record.name}.txt`;
-      const url = await s3Client.upload(_cfg, {
-        content: text,
-        key: `wecom-output/${date}/${filename}`,
-      });
+      const key = `wecom-output/${date}/${Date.now()}-${record.name}.txt`;
+      const url = await s3Client.upload(_cfg, { content: text, key });
       await sendText({
-        cfg: _cfg,
-        toUser: record.userId,
+        cfg: _cfg, toUser: record.userId,
         text: `[${record.name}] 📄 输出较长，已上传：${url}`,
         logger: _logger,
       });
       return;
     } catch (err) {
-      _logger?.warn?.(`wechat_work: S3 upload failed for session=${record.name}, falling back to text: ${err.message}`);
-      // Fall through to chunked text
+      _logger?.warn?.(`wechat_work: S3 upload failed, falling back to text: ${err.message}`);
     }
   }
 
-  const prefixed = text.trim().split("\n").map(l => l).join("\n");
-  const chunks = splitWecomText(`[${record.name}]\n${prefixed}`);
+  const chunks = splitWecomText(`[${record.name}]\n${text.trim()}`);
   for (const chunk of chunks) {
     await sendText({ cfg: _cfg, toUser: record.userId, text: chunk, logger: _logger });
   }
@@ -475,14 +515,11 @@ async function _sendOutput(record, text) {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 async function _destroyRecord(record, userStore, name) {
-  // Stop file watcher
+  if (record.startupConfirmTimer) clearTimeout(record.startupConfirmTimer);
   record.watcherClose?.();
   if (record.flushTimer) clearTimeout(record.flushTimer);
 
-  // Kill tmux session
   await execFile("tmux", ["kill-session", "-t", record.tmuxName]).catch(() => {});
-
-  // Clean up files
   await fs.unlink(record.logFile).catch(() => {});
   await fs.unlink(record.metaFile).catch(() => {});
 
@@ -496,28 +533,20 @@ async function _destroyRecord(record, userStore, name) {
 
 async function _cleanupStaleFiles() {
   let entries;
-  try {
-    entries = await fs.readdir(SESSION_DIR);
-  } catch {
-    return;
-  }
+  try { entries = await fs.readdir(SESSION_DIR); } catch { return; }
 
-  // Get live tmux session short IDs
   let liveIds = new Set();
   try {
     const { stdout } = await execFile("tmux", ["ls", "-F", "#{session_name}"]);
-    for (const name of stdout.trim().split("\n")) {
-      if (name.startsWith("wechat-")) liveIds.add(name.slice("wechat-".length));
+    for (const n of stdout.trim().split("\n")) {
+      if (n.startsWith("wechat-")) liveIds.add(n.slice("wechat-".length));
     }
-  } catch {
-    // tmux ls fails when no sessions exist — that's fine
-  }
+  } catch {}
 
   for (const entry of entries) {
     const m = entry.match(/^([0-9a-f]{8})\.(log|meta\.json)$/);
     if (!m) continue;
-    const shortId = m[1];
-    if (!liveIds.has(shortId)) {
+    if (!liveIds.has(m[1])) {
       await fs.unlink(path.join(SESSION_DIR, entry)).catch(() => {});
     }
   }
@@ -527,11 +556,9 @@ async function _recoverSessions() {
   let stdout;
   try {
     ({ stdout } = await execFile("tmux", ["ls", "-F", "#{session_name}"]));
-  } catch {
-    return; // no sessions
-  }
+  } catch { return; }
 
-  const tmuxNames = stdout.trim().split("\n").filter((n) => n.startsWith("wechat-"));
+  const tmuxNames = stdout.trim().split("\n").filter(n => n.startsWith("wechat-"));
 
   for (const tmuxName of tmuxNames) {
     const shortId = tmuxName.slice("wechat-".length);
@@ -541,23 +568,21 @@ async function _recoverSessions() {
     let meta;
     try {
       meta = JSON.parse(await fs.readFile(metaFile, "utf8"));
-    } catch {
-      continue; // no metadata, skip
-    }
+    } catch { continue; }
 
     const { userId, name, startedAt, tool } = meta;
     if (!userId || !name) continue;
 
-    // Start watching from current end of file (skip historical content)
-    let fileSize = 0;
-    try {
-      const stat = await fs.stat(logFile);
-      fileSize = stat.size;
-    } catch {}
-
     // Stop any existing pipe-pane, then reattach
     await execFile("tmux", ["pipe-pane", "-t", tmuxName]).catch(() => {});
     await execFile("tmux", ["pipe-pane", "-o", "-t", tmuxName, `cat >> ${logFile}`]).catch(() => {});
+
+    // Snapshot current line count so we skip content from before restart
+    let processedLines = 0;
+    try {
+      const { stdout: cap } = await execFile("tmux", ["capture-pane", "-p", "-S", "-", "-t", tmuxName]);
+      processedLines = _parseCapture(cap).length;
+    } catch {}
 
     const record = {
       shortId,
@@ -568,8 +593,9 @@ async function _recoverSessions() {
       logFile,
       metaFile,
       userId,
-      offset: fileSize,
-      buffer: "",
+      processedLines,
+      startupPhase: false,   // recovered sessions are already running
+      startupConfirmTimer: null,
       flushTimer: null,
       watcherClose: null,
       dead: false,
@@ -581,7 +607,6 @@ async function _recoverSessions() {
 
     _logger?.info?.(`wechat_work: recovered session name=${name} user=${userId}`);
 
-    // Notify user
     await sendText({
       cfg: _cfg,
       toUser: userId,
@@ -599,22 +624,20 @@ function _startLivenessCheck() {
     try {
       const { stdout } = await execFile("tmux", ["ls", "-F", "#{session_name}"]);
       for (const n of stdout.trim().split("\n")) liveSet.add(n);
-    } catch {
-      // tmux ls fails when no sessions — all sessions are dead
-    }
+    } catch {}
 
     for (const [userId, userStore] of store) {
       for (const [name, record] of userStore.sessions) {
         if (!record.dead && !liveSet.has(record.tmuxName)) {
           record.dead = true;
+          if (record.startupConfirmTimer) clearTimeout(record.startupConfirmTimer);
           record.watcherClose?.();
           if (record.flushTimer) clearTimeout(record.flushTimer);
           if (userStore.active === name) userStore.active = null;
 
           _logger?.info?.(`wechat_work: session ended name=${name} user=${userId}`);
           await sendText({
-            cfg: _cfg,
-            toUser: userId,
+            cfg: _cfg, toUser: userId,
             text: `[${name}] ✗ 会话已结束。`,
             logger: _logger,
           }).catch(() => {});
