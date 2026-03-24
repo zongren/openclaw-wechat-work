@@ -37,6 +37,15 @@ export function extractInboundEnvelope(msgObj) {
     const s = String(v ?? "").trim();
     return s || "";
   };
+
+  // vote_interaction submit: SelectedItems > SelectedItem > OptionId
+  let selectedOptionId = "";
+  const selected = msgObj.SelectedItems?.SelectedItem;
+  if (selected) {
+    const items = Array.isArray(selected) ? selected : [selected];
+    selectedOptionId = str(items[0]?.OptionId);
+  }
+
   return {
     msgType: str(msgObj.MsgType).toLowerCase(),
     fromUser: str(msgObj.FromUserName),
@@ -46,5 +55,6 @@ export function extractInboundEnvelope(msgObj) {
     eventKey: str(msgObj.EventKey),
     createTime: str(msgObj.CreateTime),
     taskId: str(msgObj.TaskId),
+    selectedOptionId,
   };
 }

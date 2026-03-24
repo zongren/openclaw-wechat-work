@@ -6,7 +6,7 @@ import { hasPendingInteraction, resolveInteraction } from "./interaction.js";
 const WELCOME_TEXT = "\u4f60\u597d\uff0c\u6211\u662f AI \u52a9\u624b\uff0c\u76f4\u63a5\u53d1\u6d88\u606f\u5373\u53ef\u5f00\u59cb\u5bf9\u8bdd\u3002";
 
 export async function processInbound({ api, cfg, inbound }) {
-  const { msgType, fromUser, content, eventType, eventKey, msgId, taskId } = inbound;
+  const { msgType, fromUser, content, eventType, eventKey, msgId, taskId, selectedOptionId } = inbound;
 
   // ── Interaction intercept: capture reply if user has a pending interaction
   if (msgType === "text" && content && hasPendingInteraction(fromUser)) {
@@ -54,11 +54,15 @@ export async function processInbound({ api, cfg, inbound }) {
       }
     }
 
-    if (eventType === "template_card_event" && eventKey) {
-      const result = resolveInteraction({ fromUser, eventKey, taskId });
-      if (result === true) {
-        updateTemplateCard({ cfg, toUser: fromUser, taskId, clickedKey: eventKey, logger: api.logger }).catch(() => {});
-        return;
+    if (eventType === "template_card_event") {
+      // vote_interaction submit comes with selectedOptionId; button_interaction uses eventKey
+      const resolveKey = selectedOptionId || eventKey;
+      if (resolveKey) {
+        const result = resolveInteraction({ fromUser, eventKey: resolveKey, taskId, selectedOptionId });
+        if (result === true) {
+          updateTemplateCard({ cfg, toUser: fromUser, taskId, clickedKey: resolveKey, logger: api.logger }).catch(() => {});
+          return;
+        }
       }
       return; // stale card click — ignore silently
     }

@@ -26,29 +26,33 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
 
   const taskId = crypto.randomUUID();
 
-  // Try template card first (best UX — tappable buttons)
+  // Try vote_interaction card (single-select radio list — works where button_interaction fails)
   let cardSent = false;
   if (type === "choice" && Array.isArray(options) && options.length > 0) {
     try {
-      const buttonList = options.map((opt, i) => ({
-        text: opt.slice(0, 32),   // button text max ~32 chars
-        style: 1,
-        key: `choice_${i + 1}`,
-      }));
       await sendTemplateCard({
         cfg,
         toUser,
         templateCard: {
-          card_type: "button_interaction",
+          card_type: "vote_interaction",
           task_id: taskId,
           main_title: { title: prompt.slice(0, 128) },
-          button: { button_list: buttonList },
+          checkbox: {
+            question_key: taskId,
+            option_list: options.map((opt, i) => ({
+              id: String(i + 1),
+              text: opt.slice(0, 128),
+              is_checked: false,
+            })),
+            mode: 0,  // 0 = single select (radio)
+          },
+          submit_button: { text: "确认", key: "submit" },
         },
         logger,
       });
       cardSent = true;
     } catch (err) {
-      logger?.info?.(`wechat_work: template card send failed, using text fallback: ${String(err?.message || err)}`);
+      logger?.info?.(`wechat_work: vote_interaction card failed, using text fallback: ${String(err?.message || err)}`);
     }
   } else if (type === "confirm") {
     try {
@@ -56,21 +60,24 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
         cfg,
         toUser,
         templateCard: {
-          card_type: "button_interaction",
+          card_type: "vote_interaction",
           task_id: taskId,
           main_title: { title: prompt.slice(0, 128) },
-          button: {
-            button_list: [
-              { text: "是", style: 1, key: "confirm_yes" },
-              { text: "否", style: 2, key: "confirm_no" },
+          checkbox: {
+            question_key: taskId,
+            option_list: [
+              { id: "yes", text: "是", is_checked: false },
+              { id: "no",  text: "否", is_checked: false },
             ],
+            mode: 0,
           },
+          submit_button: { text: "确认", key: "submit" },
         },
         logger,
       });
       cardSent = true;
     } catch (err) {
-      logger?.info?.(`wechat_work: template card send failed, using text fallback: ${String(err?.message || err)}`);
+      logger?.info?.(`wechat_work: vote_interaction card failed, using text fallback: ${String(err?.message || err)}`);
     }
   }
 
@@ -111,30 +118,49 @@ export async function requestUserInput({ cfg, toUser, type, prompt, options, log
   });
 }
 
-export function resolveInteraction({ fromUser, reply, eventKey, taskId }) {
+export function resolveInteraction({ fromUser, reply, eventKey, taskId, selectedOptionId }) {
   const entry = pendingInteractions.get(fromUser);
   if (!entry) return false;
 
-  // Template card event — verify taskId matches
-  if (eventKey) {
+  // Template card event (vote_interaction submit or button_interaction click)
+  if (eventKey || selectedOptionId) {
     if (taskId && entry.taskId !== taskId) return false; // stale card
 
+    // vote_interaction: selectedOptionId is the option's `id` field (1-based index string or "yes"/"no")
+    const optionId = selectedOptionId || eventKey;
+
     if (entry.type === "choice") {
-      const match = eventKey.match(/^choice_(\d+)$/);
+      // vote_interaction uses numeric id strings ("1", "2", ...)
+      const idx = parseInt(optionId, 10) - 1;
+      if (!isNaN(idx) && entry.options && idx >= 0 && idx < entry.options.length) {
+        clearTimeout(entry.timeoutTimer);
+        pendingInteractions.delete(fromUser);
+        entry.resolve({ value: entry.options[idx], raw: optionId, type: "card" });
+        return true;
+      }
+      // Fallback: button_interaction choice_N style
+      const match = optionId.match(/^choice_(\d+)$/);
       if (match) {
-        const idx = parseInt(match[1], 10) - 1;
-        if (entry.options && idx >= 0 && idx < entry.options.length) {
+        const idx2 = parseInt(match[1], 10) - 1;
+        if (entry.options && idx2 >= 0 && idx2 < entry.options.length) {
           clearTimeout(entry.timeoutTimer);
           pendingInteractions.delete(fromUser);
-          entry.resolve({ value: entry.options[idx], raw: eventKey, type: "card" });
+          entry.resolve({ value: entry.options[idx2], raw: optionId, type: "card" });
           return true;
         }
       }
     } else if (entry.type === "confirm") {
-      if (eventKey === "confirm_yes" || eventKey === "confirm_no") {
+      // vote_interaction uses "yes"/"no" ids
+      if (optionId === "yes" || optionId === "confirm_yes") {
         clearTimeout(entry.timeoutTimer);
         pendingInteractions.delete(fromUser);
-        entry.resolve({ value: eventKey === "confirm_yes", raw: eventKey, type: "card" });
+        entry.resolve({ value: true, raw: optionId, type: "card" });
+        return true;
+      }
+      if (optionId === "no" || optionId === "confirm_no") {
+        clearTimeout(entry.timeoutTimer);
+        pendingInteractions.delete(fromUser);
+        entry.resolve({ value: false, raw: optionId, type: "card" });
         return true;
       }
     }
