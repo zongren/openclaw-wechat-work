@@ -1,6 +1,7 @@
 import { sendText } from "./api-client.js";
 import { requestUserInput, cancelInteraction } from "./interaction.js";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -220,7 +221,14 @@ async function handleRestart({ api, cfg, fromUser }) {
     // best-effort
   }
   setTimeout(() => {
-    api.logger?.info?.("wechat_work: exiting process for restart");
+    api.logger?.info?.("wechat_work: restarting process");
+    // Spawn a detached copy of ourselves, then exit — works on macOS without a process manager
+    const child = spawn(process.argv[0], process.argv.slice(1), {
+      detached: true,
+      stdio: "inherit",
+      env: process.env,
+    });
+    child.unref();
     process.exit(0);
   }, 1000);
   return null;
