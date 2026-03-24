@@ -67,13 +67,15 @@ export async function processInbound({ api, cfg, inbound }) {
       return; // stale card click — ignore silently
     }
 
-    if (eventType === "subscribe" || eventType === "enter_agent") {
+    if (eventType === "subscribe") {
       api.logger?.info?.(`wechat_work: ${eventType} event from=${fromUser}`);
       await sendText({ cfg, toUser: fromUser, text: WELCOME_TEXT, logger: api.logger });
       return;
     }
 
-    api.logger?.info?.(`wechat_work: ignoring event type=${eventType} key=${eventKey || "n/a"}`);
+    if (eventType !== "location") {
+      api.logger?.info?.(`wechat_work: ignoring event type=${eventType} key=${eventKey || "n/a"}`);
+    }
     return;
   }
 
