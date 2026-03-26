@@ -9,8 +9,6 @@ export const MENU_KEY_MAP = {
   CMD_ABOUT: "/about",
   CMD_FEEDBACK: "/feedback",
   CMD_RESTART: "/restart",
-  CMD_CLAUDE_NEW: "/claude",
-  CMD_CLAUDE_LIST: "/list",
 };
 
 const MENU_DEFINITION = {
@@ -27,21 +25,6 @@ const MENU_DEFINITION = {
           type: "click",
           name: "\u6e05\u9664\u5386\u53f2",
           key: "CMD_CLEAR",
-        },
-      ],
-    },
-    {
-      name: "Claude CLI",
-      sub_button: [
-        {
-          type: "click",
-          name: "\u542f\u52a8 Claude",
-          key: "CMD_CLAUDE_NEW",
-        },
-        {
-          type: "click",
-          name: "\u4f1a\u8bdd\u5217\u8868",
-          key: "CMD_CLAUDE_LIST",
         },
         {
           type: "click",

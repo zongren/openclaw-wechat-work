@@ -134,3 +134,4 @@ export async function createMenu({ cfg, menuDef, logger }) {
   logger?.info?.("wechat_work: agent menu created successfully");
   return json;
 }
+
