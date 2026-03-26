@@ -706,7 +706,7 @@ async function _recoverSessions() {
 // ── Liveness check ────────────────────────────────────────────────────────────
 
 function _startLivenessCheck() {
-  setInterval(async () => {
+  const timer = setInterval(async () => {
     let liveSet = new Set();
     try {
       const { stdout } = await execFile("tmux", ["ls", "-F", "#{session_name}"]);
@@ -732,4 +732,5 @@ function _startLivenessCheck() {
       }
     }
   }, LIVENESS_INTERVAL_MS);
+  timer.unref(); // don't keep the process alive just for liveness checks
 }
