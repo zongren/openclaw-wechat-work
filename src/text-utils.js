@@ -1,4 +1,5 @@
 export const WECOM_TEXT_BYTE_LIMIT = 2048;
+export const WECOM_MARKDOWN_BYTE_LIMIT = 4096;
 
 export function getByteLength(str) {
   return Buffer.byteLength(str, "utf8");

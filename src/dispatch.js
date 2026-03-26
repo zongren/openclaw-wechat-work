@@ -1,4 +1,4 @@
-import { sendText } from "./api-client.js";
+import { sendText, sendMarkdown } from "./api-client.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -242,7 +242,7 @@ async function dispatchAI({ api, cfg, sessionId, fromUser, messageText, msgId })
     const text = typeof payload === "string" ? payload : payload?.text;
     if (!text) return;
     if (info?.kind === "block") return;
-    await sendText({ cfg, toUser: fromUser, text, logger: api.logger });
+    await sendMarkdown({ cfg, toUser: fromUser, text, logger: api.logger });
   };
 
   const onError = async (err) => {
