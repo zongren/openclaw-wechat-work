@@ -24,9 +24,10 @@ export default function register(api) {
 
   logger?.info?.(`wechat_work: registered channel plugin, webhook at ${webhookPath}`);
 
-  // Create agent menu only when running as a gateway server (api.on available),
-  // not for one-shot CLI commands like "openclaw devices list".
-  if (typeof api.on === "function" && cfg.corpId && cfg.corpSecret && cfg.agentId) {
+  // Create agent menu only when the gateway server is starting,
+  // not for one-shot CLI commands like "openclaw hooks list".
+  const isGateway = process.argv.includes("gateway");
+  if (isGateway && cfg.corpId && cfg.corpSecret && cfg.agentId) {
     createAgentMenu({ cfg, logger }).catch((err) => {
       logger?.warn?.(`wechat_work: menu creation failed (non-fatal): ${String(err?.message || err)}`);
     });
