@@ -2,8 +2,18 @@ import { createChannelPlugin } from "./channel-plugin.js";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createAgentMenu } from "./menu.js";
 import { sendText } from "./api-client.js";
+import { execFile as _execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFile = promisify(_execFile);
+
+// Prevent duplicate initialization when OpenClaw calls register() multiple times
+let _initialized = false;
 
 export default function register(api) {
+  if (_initialized) return;
+  _initialized = true;
+
   const cfg = api.config?.channels?.wechat_work;
   if (!cfg) {
     api.logger?.warn?.("wechat_work: no config found at channels.wechat_work, skipping registration");
@@ -25,9 +35,8 @@ export default function register(api) {
 
   logger?.info?.(`wechat_work: registered channel plugin, webhook at ${webhookPath}`);
 
-  // Gateway-only initialization: only run in full registration mode,
-  // not for one-shot CLI commands (setup-only / setup-runtime).
-  if (api.registrationMode !== "full") return;
+  // Gateway-only initialization: skip for one-shot CLI commands
+  if (!process.argv.includes("gateway")) return;
 
   // Create agent menu on gateway start
   if (cfg.corpId && cfg.corpSecret && cfg.agentId) {
@@ -36,24 +45,60 @@ export default function register(api) {
     });
   }
 
-  // Notify admin via WeChat Work when a new device pairing request arrives
+  // Poll for pending device pairing requests and notify admin via WeChat Work
   const adminUserId = cfg.adminUserId;
-  if (adminUserId && typeof api.on === "function") {
-    api.on("device:pairing", (event) => {
-      const ctx = event.context ?? event;
-      const deviceId = ctx.deviceId ?? ctx.device_id ?? ctx.id ?? "未知";
-      const role = ctx.role ?? "未知";
-      const text =
-        `🔔 新设备配对请求\n` +
-        `设备 ID：${deviceId}\n` +
-        `角色：${role}\n\n` +
-        `运行以下命令处理：\n` +
-        `• openclaw devices approve ${deviceId}\n` +
-        `• openclaw devices reject ${deviceId}`;
-      sendText({ cfg, toUser: adminUserId, text, logger }).catch((err) => {
-        logger?.warn?.(`wechat_work: failed to send device pairing notification: ${String(err?.message || err)}`);
-      });
-    });
-    logger?.info?.(`wechat_work: device pairing notifications enabled (admin=${adminUserId})`);
+  if (adminUserId) {
+    _startDevicePairingPoller({ cfg, logger, adminUserId });
   }
+}
+
+// ── Device pairing poller ─────────────────────────────────────────────────────
+
+const POLL_INTERVAL_MS = 30_000;
+const _seenRequestIds = new Set();
+
+async function _startDevicePairingPoller({ cfg, logger, adminUserId }) {
+  // Snapshot existing pending requests on startup so we don't re-notify them
+  try {
+    const initial = await _fetchPendingDevices();
+    for (const d of initial) _seenRequestIds.add(d.requestId);
+    logger?.info?.(`wechat_work: device pairing poller started (${initial.length} pre-existing pending requests ignored)`);
+  } catch (err) {
+    logger?.warn?.(`wechat_work: device pairing initial poll failed: ${String(err?.message || err)}`);
+  }
+
+  const timer = setInterval(async () => {
+    try {
+      const pending = await _fetchPendingDevices();
+      for (const device of pending) {
+        if (_seenRequestIds.has(device.requestId)) continue;
+        _seenRequestIds.add(device.requestId);
+
+        const text =
+          `🔔 新设备配对请求\n` +
+          `设备 ID：${device.deviceId}\n` +
+          `平台：${device.platform || "未知"}\n` +
+          `角色：${device.role || "未知"}\n\n` +
+          `处理命令：\n` +
+          `• openclaw devices approve ${device.requestId}\n` +
+          `• openclaw devices reject ${device.requestId}`;
+
+        sendText({ cfg, toUser: adminUserId, text, logger }).catch((err) => {
+          logger?.warn?.(`wechat_work: failed to send device pairing notification: ${String(err?.message || err)}`);
+        });
+      }
+    } catch {
+      // Polling errors are transient — stay silent
+    }
+  }, POLL_INTERVAL_MS);
+  timer.unref();
+}
+
+async function _fetchPendingDevices() {
+  const { stdout } = await execFile("openclaw", ["devices", "list", "--json"], { timeout: 15_000 });
+  // Strip any plugin log prefix lines before the JSON object
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart === -1) return [];
+  const data = JSON.parse(stdout.slice(jsonStart));
+  return Array.isArray(data.pending) ? data.pending : [];
 }
