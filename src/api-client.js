@@ -1,4 +1,4 @@
-import { splitWecomText, getByteLength, WECOM_MARKDOWN_BYTE_LIMIT } from "./text-utils.js";
+import { splitWecomText, getByteLength } from "./text-utils.js";
 
 const WECOM_API_BASE = "https://qyapi.weixin.qq.com";
 
@@ -63,36 +63,6 @@ export async function sendText({ cfg, toUser, text, logger }) {
       throw new Error(`WeCom send failed: errcode=${json.errcode} errmsg=${json.errmsg}`);
     }
     logger?.info?.(`wechat_work: message sent ok (to=${toUser}, msgid=${json?.msgid ?? "n/a"})`);
-    if (i < chunks.length - 1) {
-      await sleep(300);
-    }
-  }
-}
-
-export async function sendMarkdown({ cfg, toUser, text, logger }) {
-  const chunks = splitWecomText(text, WECOM_MARKDOWN_BYTE_LIMIT);
-  logger?.info?.(`wechat_work: sending markdown in ${chunks.length} chunks, total bytes=${getByteLength(text)}`);
-
-  for (let i = 0; i < chunks.length; i += 1) {
-    const accessToken = await getAccessToken(cfg);
-    const sendUrl = `${WECOM_API_BASE}/cgi-bin/message/send?access_token=${encodeURIComponent(accessToken)}`;
-    const body = {
-      touser: toUser,
-      msgtype: "markdown",
-      agentid: cfg.agentId,
-      markdown: { content: chunks[i] },
-    };
-    const res = await fetch(sendUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const json = await res.json();
-    if (json.errcode && json.errcode !== 0) {
-      logger?.error?.(`wechat_work: sendMarkdown failed: ${JSON.stringify(json)}`);
-      throw new Error(`WeCom sendMarkdown failed: errcode=${json.errcode} errmsg=${json.errmsg}`);
-    }
-    logger?.info?.(`wechat_work: markdown sent ok (to=${toUser}, msgid=${json?.msgid ?? "n/a"})`);
     if (i < chunks.length - 1) {
       await sleep(300);
     }
