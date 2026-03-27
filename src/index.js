@@ -1,6 +1,7 @@
 import { createChannelPlugin } from "./channel-plugin.js";
 import { createWebhookHandler } from "./webhook-handler.js";
 import { createAgentMenu } from "./menu.js";
+import { sendText } from "./api-client.js";
 
 export default function register(api) {
   const cfg = api.config?.channels?.wechat_work;
@@ -24,12 +25,35 @@ export default function register(api) {
 
   logger?.info?.(`wechat_work: registered channel plugin, webhook at ${webhookPath}`);
 
-  // Create agent menu only when the gateway server is starting,
-  // not for one-shot CLI commands like "openclaw hooks list".
-  const isGateway = process.argv.includes("gateway");
-  if (isGateway && cfg.corpId && cfg.corpSecret && cfg.agentId) {
+  // Gateway-only initialization: only run in full registration mode,
+  // not for one-shot CLI commands (setup-only / setup-runtime).
+  if (api.registrationMode !== "full") return;
+
+  // Create agent menu on gateway start
+  if (cfg.corpId && cfg.corpSecret && cfg.agentId) {
     createAgentMenu({ cfg, logger }).catch((err) => {
       logger?.warn?.(`wechat_work: menu creation failed (non-fatal): ${String(err?.message || err)}`);
     });
+  }
+
+  // Notify admin via WeChat Work when a new device pairing request arrives
+  const adminUserId = cfg.adminUserId;
+  if (adminUserId && typeof api.on === "function") {
+    api.on("device:pairing", (event) => {
+      const ctx = event.context ?? event;
+      const deviceId = ctx.deviceId ?? ctx.device_id ?? ctx.id ?? "未知";
+      const role = ctx.role ?? "未知";
+      const text =
+        `🔔 新设备配对请求\n` +
+        `设备 ID：${deviceId}\n` +
+        `角色：${role}\n\n` +
+        `运行以下命令处理：\n` +
+        `• openclaw devices approve ${deviceId}\n` +
+        `• openclaw devices reject ${deviceId}`;
+      sendText({ cfg, toUser: adminUserId, text, logger }).catch((err) => {
+        logger?.warn?.(`wechat_work: failed to send device pairing notification: ${String(err?.message || err)}`);
+      });
+    });
+    logger?.info?.(`wechat_work: device pairing notifications enabled (admin=${adminUserId})`);
   }
 }
