@@ -69,56 +69,6 @@ export async function sendText({ cfg, toUser, text, logger }) {
   }
 }
 
-export async function sendTemplateCard({ cfg, toUser, templateCard, logger }) {
-  const accessToken = await getAccessToken(cfg);
-  const url = `${WECOM_API_BASE}/cgi-bin/message/send?access_token=${encodeURIComponent(accessToken)}`;
-  const body = {
-    touser: toUser,
-    msgtype: "template_card",
-    agentid: cfg.agentId,
-    template_card: templateCard,
-  };
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const json = await res.json();
-  if (json.errcode && json.errcode !== 0) {
-    logger?.error?.(`wechat_work: sendTemplateCard failed: ${JSON.stringify(json)}`);
-    throw new Error(`WeCom sendTemplateCard failed: errcode=${json.errcode} errmsg=${json.errmsg}`);
-  }
-  logger?.info?.(`wechat_work: template card sent ok (to=${toUser})`);
-  return json;
-}
-
-export async function updateTemplateCard({ cfg, toUser, taskId, clickedKey, logger }) {
-  try {
-    const accessToken = await getAccessToken(cfg);
-    const url = `${WECOM_API_BASE}/cgi-bin/message/update_template_card?access_token=${encodeURIComponent(accessToken)}`;
-    const body = {
-      userids: [toUser],
-      agentid: cfg.agentId,
-      task_id: taskId,
-      template_card: {
-        card_type: "button_interaction",
-        button: { replace_name: clickedKey },
-      },
-    };
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const json = await res.json();
-    if (json.errcode && json.errcode !== 0) {
-      logger?.error?.(`wechat_work: updateTemplateCard failed: ${JSON.stringify(json)}`);
-    }
-  } catch (err) {
-    logger?.error?.(`wechat_work: updateTemplateCard error: ${String(err?.message || err)}`);
-  }
-}
-
 export async function createMenu({ cfg, menuDef, logger }) {
   const accessToken = await getAccessToken(cfg);
   const url = `${WECOM_API_BASE}/cgi-bin/menu/create?access_token=${encodeURIComponent(accessToken)}&agentid=${encodeURIComponent(cfg.agentId)}`;
